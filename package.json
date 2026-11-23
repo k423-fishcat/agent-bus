@@ -1,0 +1,24 @@
+{
+  "name": "agent-bus",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Local bidirectional message bus between Google Antigravity CLI (agy) and OpenAI Codex CLI",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/k423-fishcat/agent-bus.git"
+  },
+  "bin": {
+    "agent-bus": "bin/bus.mjs"
+  },
+  "scripts": {
+    "init": "node bin/bus.mjs init",
+    "doctor": "node bin/bus.mjs doctor",
+    "install-bus": "node bin/bus.mjs install",
+    "test": "node test/mcp-smoke.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

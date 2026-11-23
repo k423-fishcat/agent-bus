@@ -9,7 +9,8 @@ import {
   saveSession,
   resetSession,
   listChannels,
-  sanitizeChannel
+  sanitizeChannel,
+  resolveChannel
 } from './config.mjs';
 import { newId, writeMessage, readMessage, updateMessage, listMessages } from './store.mjs';
 import { buildPeerPrompt, formatBackground, excerpt } from './prompt.mjs';
@@ -47,6 +48,7 @@ export function peers() {
         channel,
         session: state.session || null,
         turns: state.turns || 0,
+        cwd: state.cwd || null,
         updatedAt: state.updatedAt || null
       };
     });
@@ -79,7 +81,7 @@ export function createMessage({
   text,
   threadId,
   delivery = 'peer',
-  channel = 'default',
+  channel = null,
   cwd = null,
   sessionOverride = null,
   newSession = false,
@@ -92,7 +94,7 @@ export function createMessage({
     to,
     text: String(text ?? ''),
     replyTo: null,
-    channel: sanitizeChannel(channel),
+    channel: resolveChannel({ channel, cwd }),
     cwd: cwd || null,
     contextFromThread: contextFromThread || null,
     createdAt: new Date().toISOString(),
@@ -344,7 +346,11 @@ async function deliverMessage(message) {
       onSession: (sessionId) => {
         if (!sessionId) return;
         if (sessionId !== previous.session) {
-          saveSession(message.to, { session: sessionId, turns: (previous.turns || 0) + 1, kind: target.kind }, channel);
+          saveSession(
+            message.to,
+            { session: sessionId, turns: (previous.turns || 0) + 1, kind: target.kind, cwd: agent.cwd },
+            channel
+          );
         }
         updateMessage(message.id, { session: sessionId });
         appendProgress(message.id, `会话已就绪: ${sessionId}`);
@@ -392,7 +398,7 @@ async function deliverMessage(message) {
     const continuing = useSession && useSession === session;
     saveSession(
       message.to,
-      { session, turns: continuing ? (previous.turns || 0) + 1 : (previous.turns || 0) + 1, kind: target.kind },
+      { session, turns: continuing ? (previous.turns || 0) + 1 : (previous.turns || 0) + 1, kind: target.kind, cwd: agent.cwd },
       channel
     );
   }

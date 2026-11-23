@@ -102,13 +102,14 @@ node bin/bus.mjs cancel --id <msg_id>
 ## 多项目隔离
 
 ```powershell
-node bin\bus.mjs ask  --from agy --to codex --channel proj-a --cwd E:\Work\a "看看这个模块"
-node bin\bus.mjs send --from agy --to codex --channel proj-b --cwd E:\Work\b "跑一下测试"
+node bin/bus.mjs ask  --from agy --to codex --cwd E:\Work\a "看看这个模块"
+node bin/bus.mjs send --from agy --to codex --cwd E:\Work\b "跑一下测试"
+node bin/bus.mjs send --from agy --to codex --cwd E:\Work\a --channel feat-login "单独开一条支线"
 ```
 
-- `channel` 把会话按 `(peer, channel)` 分开，存成 `sessions/<agent>__<channel>.json`；不同项目上下文互不干扰。
-- `cwd` 只覆盖本次执行的工作目录，不写回配置。
-- `bus_peers` 会列出每个 agent 的所有 channel 及其 session。
+- **自动按项目目录隔离**：只要传了 `--cwd`（不传 `--channel`），`agent-bus` 会自动按目录名 + 4 位路径哈希推导专属 `channel`（如 `a-3f9c`），不同项目天然隔离，新开 `agy` 会话也能自动续上对应项目的 `codex` 会话。
+- 显式传入 `--channel` 时优先使用你指定的频道名（适合同一项目内手动拆分子任务线）；两者都不传时落入 `default`。
+- `cwd` 只覆盖本次执行的工作目录，不写回全局配置；`bus_peers` 会列出每个 channel 对应的 `session` 与最近使用的 `cwd`。
 
 ## 对话落在哪个会话？
 

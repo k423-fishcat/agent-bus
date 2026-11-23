@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 
 export const VERSION = '0.2.0';
@@ -136,6 +137,27 @@ export function saveConfig(cfg, paths = busPaths()) {
 export function sanitizeChannel(channel) {
   const value = String(channel || 'default').trim() || 'default';
   return value.replace(/[^a-zA-Z0-9._-]+/g, '-').slice(0, 64);
+}
+
+/**
+ * Derive a stable, human-readable channel id from a workspace path so different
+ * projects never share the same "default" peer session. A 4-hex suffix prevents
+ * collisions between identically named folders under different parents.
+ */
+export function channelFromCwd(cwd) {
+  if (!cwd) return 'default';
+  const resolved = path.resolve(String(cwd));
+  const norm = process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+  const hash = crypto.createHash('sha1').update(norm).digest('hex').slice(0, 4);
+  const rawBase = path.basename(resolved) || 'root';
+  const base = rawBase.replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48) || 'proj';
+  return sanitizeChannel(`${base}-${hash}`);
+}
+
+export function resolveChannel({ channel, cwd } = {}) {
+  if (channel && String(channel).trim()) return sanitizeChannel(channel);
+  if (cwd && String(cwd).trim()) return channelFromCwd(cwd);
+  return 'default';
 }
 
 function sessionFile(agentName, channel) {

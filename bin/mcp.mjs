@@ -52,8 +52,14 @@ const TOOLS = [
         soft_timeout_sec: { type: 'number', description: 'How long to wait before returning status=running (default 90).' },
         session: { type: 'string', description: 'Specific peer session to continue (Codex thread id / agy conversation id).' },
         new_session: { type: 'boolean', description: 'Start a brand-new peer thread instead of continuing the stored one.' },
-        channel: { type: 'string', description: 'Project/channel name; sessions are isolated per (peer, channel). Default "default".' },
-        cwd: { type: 'string', description: 'Working directory for this turn (defaults to the agent config).' },
+        channel: {
+          type: 'string',
+          description: 'Optional project/channel name. If omitted and cwd is given, auto-derived from cwd so projects stay isolated.'
+        },
+        cwd: {
+          type: 'string',
+          description: 'Project working directory for this turn. Always pass this for project work so sessions auto-isolate per project.'
+        },
         context_from_thread: {
           type: 'string',
           description: 'Copy the transcript of this Codex thread into a new bus thread. Use when the target thread is locked by the front-end.'
@@ -77,8 +83,14 @@ const TOOLS = [
         text: { type: 'string', description: 'The task or message to queue.' },
         session: { type: 'string', description: 'Specific peer session to continue.' },
         new_session: { type: 'boolean', description: 'Start a brand-new peer thread.' },
-        channel: { type: 'string', description: 'Project/channel name (default "default").' },
-        cwd: { type: 'string', description: 'Working directory for this turn.' },
+        channel: {
+          type: 'string',
+          description: 'Optional project/channel name. If omitted and cwd is given, auto-derived from cwd.'
+        },
+        cwd: {
+          type: 'string',
+          description: 'Project working directory for this turn. Always pass this for project work so sessions auto-isolate per project.'
+        },
         context_from_thread: { type: 'string', description: 'Copy a Codex thread transcript in as background.' }
       },
       required: ['to', 'text']

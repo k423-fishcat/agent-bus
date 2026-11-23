@@ -189,6 +189,9 @@ node bin/bus.mjs set hooks onComplete "C:\path\hook.cmd"
       "bin": "C:\\...\\app\\resources\\codex.exe",
       "cwd": "<workspace>",
       "sandbox": "workspace-write",
+      "approvalMode": "approve-for-me",
+      "trust": true,
+      "disableSelfMcp": true,
       "model": null,
       "timeoutSec": 240,
       "liveThread": null
@@ -245,7 +248,7 @@ node bin/bus.mjs set hooks onComplete "C:\path\hook.cmd"
 - **锁冲突是启发式识别**：靠错误文本匹配 `active writer` / `no rollout found` 等，codex 改文案时需要跟着调。
 - **不推送、不监听端口**：一切靠文件 + 轮询；要“主动提醒”只能靠 `hooks` 或 `liveThread` + `codex queue`。
 - **agy 的 prompt 只能走 argv**：超过 24000 字符会被截断（会写明）。
-- **peer 会话里的对端不调用 MCP 工具**：`codex exec` 无审批通道，工具调用会被拒；提示词也要求它不要调用。对端是纯文本响应者。
+- **peer 会话默认隔离 `agent-bus` 自身，放行其他外部 MCP**：后台 `codex exec` 默认带 `--approve-for-me --trust -c mcp_servers.agent-bus.enabled=false`，防止递归死循环的同时允许调用飞书、数据库等其他外部 MCP；可通过 `agents.codex.approvalMode`（`approve-for-me` / `bypass` / `default`）调整。
 - **每次问答真实消耗额度**：codex 约 8–24k tokens/次，agy 约 9–12k/次。
 - **无鉴权、全明文**：`~/.agent-bus` 是普通 JSON；别往里丢密钥。
 

@@ -28,20 +28,34 @@ function describeItem(item) {
  */
 export async function runCodex(agent, { prompt, session, timeoutMs, env, allowForeignSession = false, onSession, onProgress }) {
   const args = ['exec'];
+  const approvalMode = agent.approvalMode || 'default';
+  if (approvalMode === 'approve-for-me') {
+    // Must appear before `resume` so it applies to both new and resumed sessions.
+    args.push('--approve-for-me');
+  } else if (approvalMode === 'bypass') {
+    args.push('--dangerously-bypass-approvals-and-sandbox');
+  }
+
   if (session) {
     args.push('resume', session);
     // A user-supplied thread may have been created in another directory;
     // --all disables the cwd filter so resume can still find it.
     if (allowForeignSession) args.push('--all');
     args.push('--skip-git-repo-check', '--json');
+    if (agent.trust !== false) args.push('--trust');
+    if (agent.disableSelfMcp !== false) args.push('-c', 'mcp_servers.agent-bus.enabled=false');
     if (agent.model) args.push('-m', agent.model);
     // Sandbox is a config value on resume; the workspace comes from the spawn cwd.
     // No quotes: the value falls back to a literal and stays shell-safe.
-    if (agent.sandbox) args.push('-c', `sandbox_mode=${agent.sandbox}`);
+    if (approvalMode !== 'bypass' && agent.sandbox) args.push('-c', `sandbox_mode=${agent.sandbox}`);
   } else {
     if (agent.cwd) args.push('-C', agent.cwd);
     args.push('--skip-git-repo-check', '--json');
-    if (agent.sandbox) args.push('-s', agent.sandbox);
+    if (agent.trust !== false) args.push('--trust');
+    if (agent.disableSelfMcp !== false) args.push('-c', 'mcp_servers.agent-bus.enabled=false');
+    if (approvalMode !== 'bypass' && approvalMode !== 'approve-for-me' && agent.sandbox) {
+      args.push('-s', agent.sandbox);
+    }
     if (agent.model) args.push('-m', agent.model);
   }
   args.push('-'); // read the prompt from stdin

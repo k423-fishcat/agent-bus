@@ -38,6 +38,12 @@ export function defaultConfig({ cwd = process.cwd() } = {}) {
         bin: detectCodexBin(),
         cwd,
         sandbox: 'workspace-write',
+        // Headless approval strategy for external MCP / tool calls:
+        // "approve-for-me" (recommended), "bypass", or "default".
+        approvalMode: 'approve-for-me',
+        trust: true,
+        // Disable agent-bus MCP inside peer turns to prevent recursion while allowing other MCPs.
+        disableSelfMcp: true,
         model: null,
         timeoutSec: DEFAULT_TIMEOUT_SEC,
         // Optional: a thread the bus may notify through `codex queue`.
@@ -78,6 +84,11 @@ export function loadConfig(paths = busPaths()) {
   for (const [name, agent] of Object.entries(cfg.agents)) {
     agent.name = name;
     agent.timeoutSec ??= DEFAULT_TIMEOUT_SEC;
+    if (agent.kind === 'codex') {
+      agent.approvalMode ??= 'approve-for-me';
+      agent.trust ??= true;
+      agent.disableSelfMcp ??= true;
+    }
   }
   cfg.defaults = {
     delivery: 'peer',

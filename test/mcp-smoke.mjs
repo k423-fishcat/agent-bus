@@ -22,7 +22,7 @@ const home = OFFLINE ? offlineHome() : null;
 
 const child = spawn(process.execPath, [MCP, '--agent', AGENT], {
   stdio: ['pipe', 'pipe', 'inherit'],
-  env: home ? { ...process.env, AGENT_BUS_HOME: home, AGENT_BUS_DEPTH: '0' } : process.env,
+  env: home ? { ...process.env, AGENT_BUS_HOME: home, AGENT_BUS_DEPTH: '0', CODEX_HOME: path.join(home, 'codex') } : process.env,
   windowsHide: true
 });
 

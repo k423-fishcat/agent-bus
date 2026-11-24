@@ -1,5 +1,20 @@
 import { runProcess } from '../spawn.mjs';
 
+const APPROVAL_MODES = new Set(['default', 'approve-for-me', 'bypass']);
+const SANDBOX_MODES = new Set(['read-only', 'workspace-write', 'danger-full-access']);
+
+function sandboxConfigError(approvalMode, sandbox) {
+  if (!APPROVAL_MODES.has(approvalMode)) return 'Codex approvalMode 无效';
+  if (sandbox && !SANDBOX_MODES.has(sandbox)) return 'Codex sandbox 无效';
+  if (approvalMode === 'approve-for-me' && sandbox && sandbox !== 'workspace-write') {
+    return 'Codex approve-for-me 固定使用 workspace-write，请修改 sandbox 或改用 default 审批模式';
+  }
+  if (approvalMode === 'bypass' && sandbox && sandbox !== 'danger-full-access') {
+    return 'Codex bypass 与限制沙箱冲突，请修改 approvalMode 或 sandbox';
+  }
+  return null;
+}
+
 function describeItem(item) {
   if (!item || typeof item !== 'object') return null;
   if (item.type === 'command_execution') {
@@ -27,8 +42,12 @@ function describeItem(item) {
  * arrives, which is what makes early persistence possible.
  */
 export async function runCodex(agent, { prompt, session, timeoutMs, env, allowForeignSession = false, onSpawn, onSession, onProgress }) {
-  const args = ['exec'];
   const approvalMode = agent.approvalMode || 'default';
+  const sandbox = agent.sandbox;
+  const configError = sandboxConfigError(approvalMode, sandbox);
+  if (configError) return { ok: false, code: 'invalid_config', threadId: session || null, error: configError };
+
+  const args = ['exec'];
   if (approvalMode === 'approve-for-me') {
     // Must appear before `resume` so it applies to both new and resumed sessions.
     args.push('--approve-for-me');
@@ -45,17 +64,14 @@ export async function runCodex(agent, { prompt, session, timeoutMs, env, allowFo
     if (agent.trust !== false) args.push('--trust');
     if (agent.disableSelfMcp !== false) args.push('-c', 'mcp_servers.agent-bus.enabled=false');
     if (agent.model) args.push('-m', agent.model);
-    // Sandbox is a config value on resume; the workspace comes from the spawn cwd.
-    // No quotes: the value falls back to a literal and stays shell-safe.
-    if (approvalMode !== 'bypass' && agent.sandbox) args.push('-c', `sandbox_mode=${agent.sandbox}`);
+    // Resume accepts sandbox through config, with the workspace from the spawn cwd.
+    if (approvalMode === 'default' && sandbox) args.push('-c', `sandbox_mode=${sandbox}`);
   } else {
     if (agent.cwd) args.push('-C', agent.cwd);
     args.push('--skip-git-repo-check', '--json');
     if (agent.trust !== false) args.push('--trust');
     if (agent.disableSelfMcp !== false) args.push('-c', 'mcp_servers.agent-bus.enabled=false');
-    if (approvalMode !== 'bypass' && approvalMode !== 'approve-for-me' && agent.sandbox) {
-      args.push('-s', agent.sandbox);
-    }
+    if (approvalMode === 'default' && sandbox) args.push('-s', sandbox);
     if (agent.model) args.push('-m', agent.model);
   }
   args.push('-'); // read the prompt from stdin
@@ -105,8 +121,12 @@ export async function runCodex(agent, { prompt, session, timeoutMs, env, allowFo
   if (res.timedOut) {
     return { ok: false, code: 'timeout', threadId, error: `codex 超过 ${Math.round(timeoutMs / 1000)}s 没有返回` };
   }
-  if (!text && failure) {
-    return { ok: false, code: 'peer_error', threadId, error: `codex 报错: ${failure}`, stderr: res.stderr };
+  if (res.spawnError) {
+    return { ok: false, code: 'spawn_failed', threadId, error: `codex 启动失败: ${res.spawnError}` };
+  }
+  if (failure || res.code !== 0) {
+    const reason = failure || res.stderr.trim().slice(-800) || `exit ${res.code ?? 'signal'}`;
+    return { ok: false, code: 'peer_error', threadId, error: `codex 报错: ${reason}`, stderr: res.stderr };
   }
   if (!text) {
     const tail = (res.stderr || res.stdout || '').trim().slice(-800);

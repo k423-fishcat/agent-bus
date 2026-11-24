@@ -88,6 +88,9 @@ export function createMessage({
   newSession = false,
   contextFromThread = null
 }) {
+  if (contextFromThread && sessionOverride) {
+    throw new Error('context_from_thread 会创建新会话，不能与 session 同时使用');
+  }
   return {
     id: newId('msg'),
     threadId: threadId || newId('conv'),
@@ -144,10 +147,18 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function observableMessage(id) {
+  const message = readMessage(id);
+  if (message?.state === 'queued' || message?.state === 'running') {
+    if (channelQueue(message).recover(failAbandonedDelivery)) return readMessage(id);
+  }
+  return message;
+}
+
 async function waitForSettlement(id, timeoutMs, intervalMs = 400) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    const message = readMessage(id);
+    const message = observableMessage(id);
     if (!message) return null;
     if (isTerminal(message)) return message;
     if (Date.now() >= deadline) return message;
@@ -162,7 +173,7 @@ async function waitForSettlement(id, timeoutMs, intervalMs = 400) {
  * timeoutMs <= 0 means wait indefinitely until a terminal state is reached.
  */
 function watchUntilSettled(id, timeoutMs = 0, fallbackPollMs = 1000) {
-  const initial = readMessage(id);
+  const initial = observableMessage(id);
   if (!initial) return Promise.resolve(null);
   if (isTerminal(initial)) return Promise.resolve(initial);
 
@@ -194,7 +205,7 @@ function watchUntilSettled(id, timeoutMs = 0, fallbackPollMs = 1000) {
     const check = () => {
       let message;
       try {
-        message = readMessage(id);
+        message = observableMessage(id);
       } catch {
         return; // transient read during atomic rename; retry on next tick
       }
@@ -219,7 +230,7 @@ function watchUntilSettled(id, timeoutMs = 0, fallbackPollMs = 1000) {
       deadlineTimer = setTimeout(() => {
         let message = null;
         try {
-          message = readMessage(id);
+          message = observableMessage(id);
         } catch {
           /* ignore */
         }
@@ -317,7 +328,8 @@ function emitEvent(event) {
 
 async function buildBackground(message) {
   if (!message.contextFromThread) return null;
-  const { messages } = await readCodexTranscript(message.contextFromThread, { limit: 20 });
+  const { file, messages } = await readCodexTranscript(message.contextFromThread, { limit: 20 });
+  if (!file) throw new Error(`找不到上下文来源会话: ${message.contextFromThread}`);
   return formatBackground(messages);
 }
 
@@ -334,12 +346,16 @@ function failDelivery(id, mapped, durationMs = null) {
   return { ok: false, messageId: id, ...failure };
 }
 
+function failAbandonedDelivery(id) {
+  return failDelivery(id, { code: 'worker_exited', message: '投递 worker 已意外退出' });
+}
+
 async function deliverMessage(message) {
   const cfg = loadConfig();
   const target = agentOf(cfg, message.to);
   const channel = sanitizeChannel(message.channel || 'default');
   const previous = loadSession(message.to, channel);
-  const useSession = message.newSession ? null : message.sessionOverride || previous.session;
+  const useSession = message.newSession || message.contextFromThread ? null : message.sessionOverride || previous.session;
   const agent = { ...target, cwd: message.cwd || target.cwd };
   const timeoutMs = (target.timeoutSec || cfg.defaults.timeoutSec) * 1000;
 
@@ -502,7 +518,7 @@ export async function ask({ from, to, text, softTimeoutSec, session, newSession,
     };
   }
 
-  const view = statusView(message.id);
+  const view = messageView(settled || message);
   return {
     ok: false,
     status: 'running',
@@ -580,7 +596,7 @@ export async function deliverById(id) {
       const current = readMessage(id);
       return isTerminal(current) ? settledResult(current) : null;
     },
-    abandoned => failDelivery(abandoned, { code: 'worker_exited', message: '投递 worker 已意外退出' })
+    failAbandonedDelivery
   );
 }
 
@@ -614,7 +630,7 @@ export function cancel({ messageId, from }) {
 }
 
 export function statusView(messageId) {
-  const message = readMessage(messageId);
+  const message = observableMessage(messageId);
   if (!message) throw new Error(`消息不存在: ${messageId}`);
   return messageView(message);
 }

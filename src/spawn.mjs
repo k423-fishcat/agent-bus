@@ -15,7 +15,7 @@ export function killTree(pid) {
 }
 
 /**
- * Spawn a CLI with an argv array (no shell quoting), feed `input` on stdin,
+ * Spawn a CLI directly with an argv array, feed `input` on stdin,
  * and collect stdout/stderr with a hard timeout.
  *
  * `onStdoutLine` fires as each line arrives, which lets transports persist a
@@ -29,20 +29,22 @@ export function runProcess({ bin, args, cwd, input, timeoutMs = 240000, env, onS
     let timedOut = false;
     let settled = false;
     let setupError;
+    let spawnError;
 
     let child;
     try {
+      if (/\.(cmd|bat)$/i.test(bin)) {
+        throw new Error('对端不支持 .cmd/.bat 启动脚本，请将 bin 指向原生可执行文件');
+      }
       child = spawn(bin, args, {
         cwd,
         env: { ...process.env, ...env },
         windowsHide: true,
         detached: process.platform !== 'win32',
-        stdio: ['pipe', 'pipe', 'pipe'],
-        // .cmd/.bat shims need a shell; real .exe binaries must not get one.
-        shell: /\.(cmd|bat)$/i.test(bin)
+        stdio: ['pipe', 'pipe', 'pipe']
       });
     } catch (err) {
-      resolve({ code: -1, stdout, stderr: String(err), timedOut: false, durationMs: 0, spawnError: String(err) });
+      resolve({ code: -1, stdout, stderr, timedOut: false, durationMs: 0, spawnError: err.message });
       return;
     }
 
@@ -51,7 +53,7 @@ export function runProcess({ bin, args, cwd, input, timeoutMs = 240000, env, onS
       settled = true;
       clearTimeout(timer);
       if (setupError) return reject(setupError);
-      resolve({ code, stdout, stderr, timedOut, durationMs: Date.now() - started });
+      resolve({ code, stdout, stderr, timedOut, durationMs: Date.now() - started, spawnError });
     };
 
     const timer = setTimeout(() => {
@@ -85,7 +87,7 @@ export function runProcess({ bin, args, cwd, input, timeoutMs = 240000, env, onS
     });
 
     child.on('error', (err) => {
-      stderr += String(err);
+      spawnError = err.message;
       finish(-1);
     });
     child.on('close', (code) => finish(code));

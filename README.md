@@ -100,6 +100,7 @@ node bin/bus.mjs cancel --id <msg_id>
 - 状态机：`queued → running → done / failed / cancelled`（旧的 `answered` 读取时归一到 `done`）。
 - 取完整答案用 `wait` 或 `watch`：两者保留原文换行和缩进。`status` 用于看进度，只带回复预览（最多 800 字符加省略号）。
 - 同一 MCP 连接正在 `bus_ask` 或 `bus_wait` 时，仍可查询和取消。取消排队中的任务会跳过这一轮；取消执行中的任务会终止对端进程树，退出后频道继续处理下一条。完成和取消以先写入的终态为准。
+- worker 异常退出后，`status`、`wait` 和 `watch` 会在对端进程退出时将任务标为 `worker_exited`。在对端仍运行期间，频道保留该轮的执行位置。
 
 ## 多项目隔离
 
@@ -139,7 +140,7 @@ node bin\bus.mjs ask --from agy --to codex --new-session "新话题"
 
 - **指定即切换**：带 `--session` 后它成为该 channel 的默认会话。
 - **跨目录也能续**：指定 id 时自动加 `--all`，别的目录建的线程也能接上。
-- **别指向活跃会话**：Codex 有 `thread-writer-locks`，UI 和 bus 同时写会冲突。冲突会被映射成 `thread_locked` 并给出建议；想复用上下文就用 `--context-from <线程id>`——读该线程的 rollout 作为背景，写进一个**新**线程，绕开写锁。
+- **复用活跃会话的上下文**可以用 `--context-from <线程id>`。它会读取该线程的 rollout 作为背景，并创建新线程。来源必须存在，且此选项与 `--session` 互斥。直接续写被前台占用的线程会返回 `thread_locked`。
 
 ## MCP 工具（9 个）
 
@@ -221,7 +222,8 @@ node bin/bus.mjs set hooks onComplete "C:\path\hook.cmd"
 - `timeoutSec`：worker 内对端进程的**硬超时**（超时会被 kill）。
 - `askSoftTimeoutSec`：`bus_ask` 的**软超时**，只影响调用方等待，不杀进程。**必须明显小于 MCP 客户端的硬超时**（约 180s），90s 是安全值。
 - `hooks.onComplete`：任务结束（done/failed/cancelled）时执行的命令，事件文件路径作为参数传入。事件同时写在 `~/.agent-bus/events/<msg_id>.json`。
-- `cwd` / `sandbox` / `model` / `effort`：透传给对应 CLI。
+- `cwd`、`model` 和 `effort` 会传给对应 CLI。Codex 的 `approvalMode` 为 `default` 时，新建和恢复会话都会使用配置的 `sandbox`。`approve-for-me` 固定使用 `workspace-write`。`bypass` 只接受未设置的 `sandbox` 或 `danger-full-access`。冲突的组合会在启动对端前报错。
+- Windows 的 `bin` 应指向原生可执行文件，例如 `codex.exe` 或 `agy-native.exe`。`.cmd` 和 `.bat` 启动脚本会被拒绝。
 - 布尔开关用 `true` 或 `false`。例如 `node bin/bus.mjs set agy skipPermissions false` 会保留 agy 的权限检查。旧配置中的字符串 `"true"` / `"false"` 也按布尔值读取。
 
 ## 完成通知（事件驱动）
@@ -258,7 +260,7 @@ node bin/bus.mjs set hooks onComplete "C:\path\hook.cmd"
 
 ## 运行测试
 
-`npm test` 在临时目录中启动 MCP、独立 worker 和模拟对端，验证频道顺序、取消、权限参数与完整回复，无需账号或模型额度。检查本机 MCP 配置用 `node test/mcp-smoke.mjs`；加 `--deep` 会向真实对端发送一条测试消息。
+`npm test` 在临时目录中启动 MCP、独立 worker 和模拟对端，验证频道顺序、取消、崩溃恢复、权限参数、消息 ID、上下文导入和回复状态，无需账号或模型额度。检查本机 MCP 配置用 `node test/mcp-smoke.mjs`，加 `--deep` 会向真实对端发送一条测试消息。
 
 ## 目录
 

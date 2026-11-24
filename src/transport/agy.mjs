@@ -76,6 +76,9 @@ export async function runAgy(agent, { prompt, session, timeoutMs, env, onSpawn, 
   if (res.timedOut) {
     return { ok: false, code: 'timeout', conversationId, error: `agy 超过 ${Math.round(timeoutMs / 1000)}s 没有返回` };
   }
+  if (res.spawnError) {
+    return { ok: false, code: 'spawn_failed', conversationId, error: `agy 启动失败: ${res.spawnError}` };
+  }
 
   const payload = final || extractFinalJson(res.stdout);
   if (!payload) {

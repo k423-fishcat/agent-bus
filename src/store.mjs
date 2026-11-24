@@ -4,6 +4,8 @@ import crypto from 'node:crypto';
 import { busPaths, ensureDirs } from './config.mjs';
 import { withLock } from './coordination.mjs';
 
+const MESSAGE_ID = /^msg_[0-9a-z]{1,16}_[0-9a-f]{8}$/;
+
 export function newId(prefix = 'msg') {
   return `${prefix}_${Date.now().toString(36)}_${crypto.randomBytes(4).toString('hex')}`;
 }
@@ -38,20 +40,34 @@ export function atomicWrite(file, data) {
   }
 }
 
-function messageFile(id, paths = busPaths()) {
-  return path.join(paths.messages, `${id}.json`);
+function messageFile(id, paths) {
+  if (typeof id !== 'string' || !MESSAGE_ID.test(id)) {
+    throw new Error('消息 ID 格式无效');
+  }
+  const dir = path.resolve(paths.messages);
+  const file = path.resolve(dir, `${id}.json`);
+  if (path.dirname(file) !== dir) throw new Error('消息文件必须在 messages 目录内');
+  return file;
+}
+
+function readMessageFile(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
 }
 
 export function writeMessage(msg, paths = busPaths()) {
+  const file = messageFile(msg.id, paths);
   ensureDirs(paths);
-  atomicWrite(messageFile(msg.id, paths), JSON.stringify(msg, null, 2));
+  atomicWrite(file, JSON.stringify(msg, null, 2));
   return msg;
 }
 
 export function readMessage(id, paths = busPaths()) {
-  const file = messageFile(id, paths);
-  if (!fs.existsSync(file)) return null;
-  return JSON.parse(fs.readFileSync(file, 'utf8'));
+  return readMessageFile(messageFile(id, paths));
 }
 
 export function updateMessage(id, patch, paths = busPaths()) {
@@ -59,12 +75,13 @@ export function updateMessage(id, patch, paths = busPaths()) {
 }
 
 export function withMessage(id, action, paths = busPaths()) {
+  const file = messageFile(id, paths);
   return withLock('message-' + id, () => {
-    const current = readMessage(id, paths);
+    const current = readMessageFile(file);
     if (!current) throw new Error(`消息不存在: ${id}`);
     return action(current, patch => {
       const next = { ...current, ...patch, updatedAt: new Date().toISOString() };
-      atomicWrite(messageFile(id, paths), JSON.stringify(next, null, 2));
+      atomicWrite(file, JSON.stringify(next, null, 2));
       return next;
     });
   }, paths);

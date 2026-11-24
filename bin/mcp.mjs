@@ -62,7 +62,7 @@ const TOOLS = [
         },
         context_from_thread: {
           type: 'string',
-          description: 'Copy the transcript of this Codex thread into a new bus thread. Use when the target thread is locked by the front-end.'
+          description: 'Copy the transcript of this Codex thread into a new bus thread. Cannot be combined with session.'
         }
       },
       required: ['to', 'text']
@@ -91,7 +91,7 @@ const TOOLS = [
           type: 'string',
           description: 'Project working directory for this turn. Always pass this for project work so sessions auto-isolate per project.'
         },
-        context_from_thread: { type: 'string', description: 'Copy a Codex thread transcript in as background.' }
+        context_from_thread: { type: 'string', description: 'Copy a Codex thread transcript into a new bus thread. Cannot be combined with session.' }
       },
       required: ['to', 'text']
     }

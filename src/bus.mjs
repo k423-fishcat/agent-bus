@@ -12,7 +12,8 @@ import {
   sanitizeChannel,
   resolveChannel
 } from './config.mjs';
-import { newId, writeMessage, readMessage, updateMessage, listMessages } from './store.mjs';
+import { newId, writeMessage, readMessage, updateMessage, listMessages, withMessage } from './store.mjs';
+import { channelQueue } from './channel-queue.mjs';
 import { buildPeerPrompt, formatBackground, excerpt } from './prompt.mjs';
 import { runAgent } from './transport/index.mjs';
 import { readCodexTranscript } from './transcript.mjs';
@@ -122,11 +123,19 @@ function spawnWorker(messageId) {
     windowsHide: true
   });
   child.unref();
+  child.on('error', error => failDelivery(messageId, { message: error.message, code: 'worker_start_failed' }));
+  if (!child.pid) throw new Error('无法启动投递 worker');
+  return child.pid;
 }
 
 function enqueue(message) {
   writeMessage(message);
-  spawnWorker(message.id);
+  try {
+    channelQueue(message).reserve(() => spawnWorker(message.id));
+  } catch (error) {
+    failDelivery(message.id, { message: error.message, code: 'worker_start_failed' });
+    throw error;
+  }
   logLine({ event: 'queued', id: message.id, from: message.from, to: message.to, channel: message.channel });
   return message;
 }
@@ -251,21 +260,27 @@ function mapError(result) {
   return { code: result?.code || 'peer_error', message: result?.error || '未知错误', hint: null };
 }
 
-function appendProgress(id, note) {
-  if (!note) return;
-  const message = readMessage(id);
-  if (!message || isTerminal(message)) return;
+function settledResult(message) {
+  const state = normalizeState(message.state);
+  return { ok: state === 'done', state, messageId: message.id, reply: message.reply, error: message.error, alreadySettled: true };
+}
 
+function whileActive(id, action) {
+  return withMessage(id, (message, save) => isTerminal(message) ? settledResult(message) : action(message, save));
+}
+
+function recordProgress(message, save, note, extra = {}) {
   const now = Date.now();
   const last = message.__lastProgressAt || 0;
   const progress = Array.isArray(message.progress) ? message.progress.slice() : [];
-  const isImportant = progress.length === 0 || /开始|完成|失败|取消/.test(note);
+  const isImportant = extra.session || progress.length === 0 || /开始|完成|失败|取消/.test(note);
 
   if (!isImportant && now - last < PROGRESS_THROTTLE_MS && progress.length >= PROGRESS_LIMIT) return;
-  if (!isImportant && now - last < PROGRESS_THROTTLE_MS && progress.at(-1) === note) return;
+  if (!isImportant && now - last < PROGRESS_THROTTLE_MS && progress.at(-1)?.note === note) return;
 
   progress.push({ at: new Date(now).toISOString(), note: String(note).slice(0, 240) });
-  updateMessage(id, {
+  save({
+    ...extra,
     progress: progress.slice(-PROGRESS_LIMIT),
     __lastProgressAt: now
   });
@@ -306,6 +321,19 @@ async function buildBackground(message) {
   return formatBackground(messages);
 }
 
+function failDelivery(id, mapped, durationMs = null) {
+  const failure = { state: 'failed', error: mapped.message, errorCode: mapped.code, hint: mapped.hint || null };
+  const message = whileActive(id, (_current, save) => save({ ...failure, peerPid: null, durationMs }));
+  if (message.alreadySettled) return message;
+  const { from, to, channel } = message;
+  logLine({ event: 'deliver_failed', id, from, to, code: mapped.code, durationMs });
+  emitEvent({
+    event: 'bus.task.failed', messageId: id, from, to, channel, state: 'failed',
+    code: mapped.code, error: mapped.message, durationMs, at: new Date().toISOString()
+  });
+  return { ok: false, messageId: id, ...failure };
+}
+
 async function deliverMessage(message) {
   const cfg = loadConfig();
   const target = agentOf(cfg, message.to);
@@ -326,12 +354,18 @@ async function deliverMessage(message) {
     contextThread: message.contextFromThread
   });
 
-  updateMessage(message.id, {
+  const claim = whileActive(message.id, (_current, save) => save({
     state: 'running',
     pid: process.pid,
+    peerPid: null,
     startedAt: new Date().toISOString(),
     progress: [{ at: new Date().toISOString(), note: `派发给 ${message.to}（${channel}）` }]
-  });
+  }));
+  if (claim.alreadySettled) return claim;
+
+  const persistSession = session => saveSession(message.to, {
+    session, turns: (previous.turns || 0) + 1, kind: target.kind, cwd: agent.cwd
+  }, channel);
 
   const started = Date.now();
   let result;
@@ -343,66 +377,27 @@ async function deliverMessage(message) {
       timeoutMs,
       env: { AGENT_BUS_DEPTH: String(depth + 1) },
       allowForeignSession: Boolean(message.sessionOverride),
+      onSpawn: pid => {
+        const active = whileActive(message.id, (_current, save) => save({ peerPid: pid }));
+        if (active.alreadySettled) killTree(pid);
+      },
       onSession: (sessionId) => {
         if (!sessionId) return;
-        if (sessionId !== previous.session) {
-          saveSession(
-            message.to,
-            { session: sessionId, turns: (previous.turns || 0) + 1, kind: target.kind, cwd: agent.cwd },
-            channel
-          );
-        }
-        updateMessage(message.id, { session: sessionId });
-        appendProgress(message.id, `会话已就绪: ${sessionId}`);
+        whileActive(message.id, (current, save) => {
+          if (sessionId !== previous.session) persistSession(sessionId);
+          recordProgress(current, save, `会话已就绪: ${sessionId}`, { session: sessionId });
+        });
       },
-      onProgress: (note) => appendProgress(message.id, note)
+      onProgress: note => note && whileActive(message.id, (current, save) => recordProgress(current, save, note))
     });
   } catch (err) {
     result = { ok: false, error: String(err?.message || err) };
   }
 
   const durationMs = Date.now() - started;
-  const current = readMessage(message.id);
-  if (current?.state === 'cancelled') {
-    logLine({ event: 'deliver_cancelled', id: message.id, from: message.from, to: message.to });
-    return { ok: false, messageId: message.id, state: 'cancelled' };
-  }
-
-  if (!result.ok) {
-    const mapped = mapError(result);
-    updateMessage(message.id, {
-      state: 'failed',
-      error: mapped.message,
-      errorCode: mapped.code,
-      hint: mapped.hint,
-      durationMs
-    });
-    logLine({ event: 'deliver_failed', id: message.id, from: message.from, to: message.to, code: mapped.code, durationMs });
-    emitEvent({
-      event: 'bus.task.failed',
-      messageId: message.id,
-      from: message.from,
-      to: message.to,
-      channel,
-      state: 'failed',
-      code: mapped.code,
-      error: mapped.message,
-      durationMs,
-      at: new Date().toISOString()
-    });
-    return { ok: false, messageId: message.id, state: 'failed', error: mapped.message, errorCode: mapped.code, hint: mapped.hint };
-  }
+  if (!result.ok) return failDelivery(message.id, mapError(result), durationMs);
 
   const session = result.session || useSession || null;
-  if (session) {
-    const continuing = useSession && useSession === session;
-    saveSession(
-      message.to,
-      { session, turns: continuing ? (previous.turns || 0) + 1 : (previous.turns || 0) + 1, kind: target.kind, cwd: agent.cwd },
-      channel
-    );
-  }
-
   const replyMessage = {
     ...createMessage({
       from: message.to,
@@ -417,19 +412,15 @@ async function deliverMessage(message) {
     expectsReply: false,
     session: session
   };
-  writeMessage(replyMessage);
-
-  updateMessage(message.id, {
-    state: 'done',
-    reply: result.text,
-    session,
-    usage: result.usage || null,
-    durationMs,
-    progress: [
-      ...((readMessage(message.id)?.progress) || []),
-      { at: new Date().toISOString(), note: `完成，用时 ${Math.round(durationMs / 1000)}s` }
-    ].slice(-PROGRESS_LIMIT)
+  const settled = whileActive(message.id, (current, save) => {
+    if (session) persistSession(session);
+    writeMessage(replyMessage);
+    save({
+      state: 'done', reply: result.text, session, peerPid: null, usage: result.usage || null, durationMs,
+      progress: [...(current.progress || []), { at: new Date().toISOString(), note: `完成，用时 ${Math.round(durationMs / 1000)}s` }].slice(-PROGRESS_LIMIT)
+    });
   });
+  if (settled) return settled;
 
   logLine({ event: 'deliver_ok', id: message.id, from: message.from, to: message.to, channel, durationMs, chars: result.text.length });
   emitEvent({
@@ -542,7 +533,7 @@ export function send({ from, to, text, session, newSession, channel, cwd, contex
 export async function wait({ messageId, timeoutSec = 60 }) {
   const settled = await waitForSettlement(messageId, Number(timeoutSec) * 1000);
   if (!settled) throw new Error(`消息不存在: ${messageId}`);
-  return statusView(messageId);
+  return messageView(settled, normalizeState(settled.state) === 'done');
 }
 
 export async function watch({ messageId, timeoutSec = 0, consume = true }) {
@@ -580,35 +571,35 @@ export async function watch({ messageId, timeoutSec = 0, consume = true }) {
 export async function deliverById(id) {
   const message = readMessage(id);
   if (!message) throw new Error(`消息不存在: ${id}`);
-  if (isTerminal(message)) {
-    return {
-      ok: normalizeState(message.state) === 'done',
-      messageId: id,
-      reply: message.reply,
-      error: message.error,
-      alreadySettled: true
-    };
-  }
-  return deliverMessage(message);
+  return channelQueue(message).run(
+    async () => {
+      try { return await deliverMessage(message); }
+      catch (error) { return failDelivery(id, { code: 'worker_error', message: error.message }); }
+    },
+    () => {
+      const current = readMessage(id);
+      return isTerminal(current) ? settledResult(current) : null;
+    },
+    abandoned => failDelivery(abandoned, { code: 'worker_exited', message: '投递 worker 已意外退出' })
+  );
 }
 
 export function cancel({ messageId, from }) {
-  const message = readMessage(messageId);
-  if (!message) throw new Error(`消息不存在: ${messageId}`);
-  if (isTerminal(message)) {
-    return { ok: false, messageId, state: normalizeState(message.state), reason: '任务已结束，无需取消' };
-  }
-
-  if (message.pid) killTree(message.pid);
-  updateMessage(messageId, {
-    state: 'cancelled',
-    cancelledAt: new Date().toISOString(),
-    cancelledBy: from || null,
-    progress: [
-      ...(message.progress || []),
-      { at: new Date().toISOString(), note: `已取消${from ? `（by ${from}）` : ''}` }
-    ].slice(-PROGRESS_LIMIT)
+  const message = withMessage(messageId, (current, save) => {
+    if (isTerminal(current)) return current;
+    save({
+      state: 'cancelled',
+      cancelledAt: new Date().toISOString(),
+      cancelledBy: from || null,
+      progress: [...(current.progress || []),
+        { at: new Date().toISOString(), note: `已取消${from ? `（by ${from}）` : ''}` }].slice(-PROGRESS_LIMIT)
+    });
+    // The worker releases its channel after the peer exits. Older running
+    // messages only recorded the worker PID.
+    killTree(Object.hasOwn(current, 'peerPid') ? current.peerPid : current.pid);
+    return current;
   });
+  if (isTerminal(message)) return { ok: false, messageId, state: normalizeState(message.state), reason: '任务已结束，无需取消' };
   logLine({ event: 'cancelled', id: messageId, by: from || null });
   emitEvent({
     event: 'bus.task.cancelled',
@@ -625,6 +616,10 @@ export function cancel({ messageId, from }) {
 export function statusView(messageId) {
   const message = readMessage(messageId);
   if (!message) throw new Error(`消息不存在: ${messageId}`);
+  return messageView(message);
+}
+
+function messageView(message, fullReply = false) {
   const state = normalizeState(message.state);
   const startedAt = message.startedAt ? Date.parse(message.startedAt) : null;
   const elapsedMs = message.durationMs ?? (startedAt ? Date.now() - startedAt : null);
@@ -642,7 +637,7 @@ export function statusView(messageId) {
     elapsedMs,
     durationMs: message.durationMs ?? null,
     progress: (message.progress || []).slice(-10),
-    reply: message.reply ? excerpt(message.reply, 800) : null,
+    reply: fullReply ? message.reply ?? null : message.reply ? excerpt(message.reply, 800) : null,
     error: message.error || null,
     errorCode: message.errorCode || null,
     hint: message.hint || null,
@@ -669,28 +664,26 @@ export function inbox(agent, { limit = 20 } = {}) {
 }
 
 export function reply({ from, messageId, text }) {
-  const original = readMessage(messageId);
-  if (!original) throw new Error(`消息不存在: ${messageId}`);
-  if (original.to !== from) {
-    throw new Error(`只能回复发给自己的消息（这条消息的收件人是 "${original.to}"）`);
-  }
-
-  updateMessage(messageId, {
-    state: 'done',
-    reply: String(text ?? ''),
-    repliedAt: new Date().toISOString()
+  const { copy, event } = withMessage(messageId, (original, save) => {
+    if (original.to !== from) throw new Error(`只能回复发给自己的消息（这条消息的收件人是 "${original.to}"）`);
+    if (isTerminal(original)) throw new Error(`这条消息已结束: ${original.state}`);
+    const copy = {
+      ...createMessage({ from, to: original.from, text, threadId: original.threadId, channel: original.channel, delivery: 'mailbox' }),
+      replyTo: original.id, state: 'delivered', expectsReply: false
+    };
+    writeMessage(copy);
+    const at = new Date().toISOString();
+    const durationMs = original.startedAt ? Date.now() - Date.parse(original.startedAt) : null;
+    save({ state: 'done', reply: copy.text, repliedAt: at, durationMs });
+    if (original.state === 'running') killTree(Object.hasOwn(original, 'peerPid') ? original.peerPid : original.pid);
+    return { copy, event: {
+      event: 'bus.task.completed', messageId, replyId: copy.id, from: original.from, to: original.to,
+      channel: original.channel, state: 'done', session: original.session, durationMs, replyPreview: excerpt(copy.text, 200), at
+    } };
   });
-
-  const replyMessage = {
-    ...createMessage({ from, to: original.from, text, threadId: original.threadId, channel: original.channel, delivery: 'mailbox' }),
-    replyTo: original.id,
-    state: 'delivered',
-    expectsReply: false
-  };
-  writeMessage(replyMessage);
-  logLine({ event: 'reply', id: original.id, from, to: original.from, chars: String(text ?? '').length });
-
-  return { ok: true, messageId: replyMessage.id, threadId: original.threadId };
+  logLine({ event: 'reply', id: messageId, from, to: copy.to, chars: copy.text.length });
+  emitEvent(event);
+  return { ok: true, messageId: copy.id, threadId: copy.threadId };
 }
 
 export function log({ limit = 20 } = {}) {

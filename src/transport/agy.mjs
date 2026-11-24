@@ -14,18 +14,22 @@ function extractFinalJson(stdout) {
   return null;
 }
 
+export function agyArgs(agent, prompt, session) {
+  const args = [`-p=${prompt}`, '--output-format', 'stream-json'];
+  if (session) args.push('--conversation', session);
+  if (agent.model) args.push('--model', agent.model);
+  if (agent.effort) args.push('--effort', agent.effort);
+  if (agent.skipPermissions === true) args.push('--dangerously-skip-permissions');
+  return args;
+}
+
 /**
  * agy takes its prompt as the value of `-p` (it must be attached with `=`),
  * and streams NDJSON events. `init` carries the conversation id right away,
  * so the peer session can be persisted before the turn completes.
  */
-export async function runAgy(agent, { prompt, session, timeoutMs, env, onSession, onProgress }) {
+export async function runAgy(agent, { prompt, session, timeoutMs, env, onSpawn, onSession, onProgress }) {
   const fitted = fitForArgv(prompt);
-  const args = [`-p=${fitted.text}`, '--output-format', 'stream-json'];
-  if (session) args.push('--conversation', session);
-  if (agent.model) args.push('--model', agent.model);
-  if (agent.effort) args.push('--effort', agent.effort);
-  if (agent.skipPermissions) args.push('--dangerously-skip-permissions');
 
   let conversationId = session || null;
   let final = null;
@@ -33,10 +37,11 @@ export async function runAgy(agent, { prompt, session, timeoutMs, env, onSession
 
   const res = await runProcess({
     bin: agent.bin,
-    args,
+    args: agyArgs(agent, fitted.text, session),
     cwd: agent.cwd,
     timeoutMs,
     env,
+    onSpawn,
     onStdoutLine: (line) => {
       if (!line.trim().startsWith('{')) return;
       let event;

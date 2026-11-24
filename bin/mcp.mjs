@@ -100,7 +100,7 @@ const TOOLS = [
     name: 'bus_wait',
     description:
       'Wait for an existing task to settle, in bounded slices. Returns the full status (state, elapsed, session, recent progress, ' +
-      'reply). A timeout returns state=running rather than an error, so you can call it again.',
+      'and the complete multiline reply when done). A timeout returns the current queued/running state; you can wait again.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -146,7 +146,7 @@ const TOOLS = [
   },
   {
     name: 'bus_status',
-    description: 'Inspect one message: state (queued/running/done/failed/cancelled), elapsed time, session, recent progress, reply, error.',
+    description: 'Inspect one message: state, elapsed time, session, recent progress, reply preview, error. Use bus_wait for the full reply.',
     inputSchema: {
       type: 'object',
       properties: { message_id: { type: 'string' } },
@@ -338,14 +338,6 @@ function startHeartbeat(progressToken, totalSec) {
   return () => clearInterval(timer);
 }
 
-let chain = Promise.resolve();
-
-function enqueue(task) {
-  const next = chain.then(task, task);
-  chain = next.catch(() => {});
-  return next;
-}
-
 async function handle(message) {
   const { id, method, params } = message;
 
@@ -374,19 +366,17 @@ async function handle(message) {
     const totalSec = Number(args.timeout_sec || args.soft_timeout_sec || 90);
     const started = Date.now();
 
-    await enqueue(async () => {
-      const stopHeartbeat = name === 'bus_ask' || name === 'bus_wait' ? startHeartbeat(progressToken, totalSec) : () => {};
-      try {
-        const result = await callTool(name, args);
-        audit({ tool: name, ok: !result.isError, ms: Date.now() - started, to: args.to || null });
-        respond(id, result);
-      } catch (error) {
-        audit({ tool: name, ok: false, ms: Date.now() - started, error: String(error?.message || error) });
-        respond(id, textResult(`agent-bus 错误: ${error?.message || error}`, true));
-      } finally {
-        stopHeartbeat();
-      }
-    });
+    const stopHeartbeat = name === 'bus_ask' || name === 'bus_wait' ? startHeartbeat(progressToken, totalSec) : () => {};
+    try {
+      const result = await callTool(name, args);
+      audit({ tool: name, ok: !result.isError, ms: Date.now() - started, to: args.to || null });
+      respond(id, result);
+    } catch (error) {
+      audit({ tool: name, ok: false, ms: Date.now() - started, error: String(error?.message || error) });
+      respond(id, textResult(`agent-bus 错误: ${error?.message || error}`, true));
+    } finally {
+      stopHeartbeat();
+    }
     return;
   }
 

@@ -76,6 +76,21 @@ export function defaultConfig({ cwd = process.cwd() } = {}) {
   };
 }
 
+const AGENT_SWITCHES = ['trust', 'disableSelfMcp', 'skipPermissions'];
+
+function booleanSetting(key, value) {
+  if (value === true || value === 'true') return true;
+  if (value === false || value === 'false') return false;
+  throw new Error(`${key} 只能设为 true 或 false`);
+}
+
+export function parseSetting(scope, key, value) {
+  if (scope === 'defaults' ? key === 'wake' : scope !== 'hooks' && AGENT_SWITCHES.includes(key)) {
+    return booleanSetting(key, value);
+  }
+  return value === 'null' ? null : /^\d+$/.test(value) ? Number(value) : value;
+}
+
 export function loadConfig(paths = busPaths()) {
   if (!fs.existsSync(paths.config)) {
     throw new Error(`agent-bus 还没初始化：缺少 ${paths.config}\n先运行: node bin/bus.mjs init`);
@@ -85,6 +100,9 @@ export function loadConfig(paths = busPaths()) {
   for (const [name, agent] of Object.entries(cfg.agents)) {
     agent.name = name;
     agent.timeoutSec ??= DEFAULT_TIMEOUT_SEC;
+    for (const key of AGENT_SWITCHES) {
+      if (agent[key] != null) agent[key] = booleanSetting(`${name}.${key}`, agent[key]);
+    }
     if (agent.kind === 'codex') {
       agent.approvalMode ??= 'approve-for-me';
       agent.trust ??= true;
@@ -99,6 +117,7 @@ export function loadConfig(paths = busPaths()) {
     ...(cfg.defaults || {})
   };
   cfg.hooks = { onComplete: null, ...(cfg.hooks || {}) };
+  if (cfg.defaults.wake != null) cfg.defaults.wake = booleanSetting('defaults.wake', cfg.defaults.wake);
   healAgentBins(cfg, paths);
   return cfg;
 }

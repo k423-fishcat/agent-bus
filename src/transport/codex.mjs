@@ -26,7 +26,7 @@ function describeItem(item) {
  * before the turn finishes; `onSession` fires the moment `thread.started`
  * arrives, which is what makes early persistence possible.
  */
-export async function runCodex(agent, { prompt, session, timeoutMs, env, allowForeignSession = false, onSession, onProgress }) {
+export async function runCodex(agent, { prompt, session, timeoutMs, env, allowForeignSession = false, onSpawn, onSession, onProgress }) {
   const args = ['exec'];
   const approvalMode = agent.approvalMode || 'default';
   if (approvalMode === 'approve-for-me') {
@@ -72,6 +72,7 @@ export async function runCodex(agent, { prompt, session, timeoutMs, env, allowFo
     input: prompt,
     timeoutMs,
     env,
+    onSpawn,
     onStdoutLine: (line) => {
       if (!line.trim().startsWith('{')) return;
       let event;

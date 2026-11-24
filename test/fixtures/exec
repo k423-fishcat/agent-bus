@@ -1,0 +1,33 @@
+// Run by the offline suite as "node exec [resume ...]"; speaks Codex NDJSON.
+import fs from 'node:fs';
+import path from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
+
+const home = process.env.AGENT_BUS_HOME;
+let prompt = '';
+for await (const chunk of process.stdin) prompt += chunk;
+const label = prompt.match(/<<<MESSAGE\r?\n([\w-]+)\r?\nMESSAGE>>>/)?.[1];
+if (!label) throw new Error('Unknown fixture prompt');
+const resume = process.argv.indexOf('resume');
+const session = resume < 0 ? 'session-' + label : process.argv[resume + 1];
+const emit = event => console.log(JSON.stringify(event));
+const starts = path.join(home, 'starts.ndjson');
+let predecessorAlive;
+if (label === 'after-worker-exit') {
+  const record = fs.readFileSync(starts, 'utf8').trim().split('\n').map(JSON.parse).find(s => s.label === 'hold-orphan');
+  try { process.kill(record.pid, 0); predecessorAlive = true; }
+  catch (error) { if (error.code !== 'ESRCH') throw error; predecessorAlive = false; }
+}
+fs.appendFileSync(starts, JSON.stringify({ label, session, resume: resume >= 0, pid: process.pid, predecessorAlive }) + '\n');
+emit({ type: 'thread.started', thread_id: session });
+if (label.startsWith('hold-')) {
+  const release = path.join(home, 'release-' + label);
+  while (!fs.existsSync(release) && !fs.existsSync(path.join(home, 'release-all'))) await delay(25);
+}
+if (label === 'fail') {
+  emit({ type: 'turn.failed', error: { message: 'fixture failure' } });
+} else {
+  const text = label === 'hold-first' ? '代码：\n' + '    answer();\n'.repeat(100) + 'END' : label;
+  emit({ type: 'item.completed', item: { type: 'agent_message', text } });
+  emit({ type: 'turn.completed' });
+}

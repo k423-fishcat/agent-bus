@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { busPaths, ensureDirs } from './config.mjs';
+import { withLock } from './coordination.mjs';
 
 export function newId(prefix = 'msg') {
   return `${prefix}_${Date.now().toString(36)}_${crypto.randomBytes(4).toString('hex')}`;
@@ -26,7 +27,7 @@ function renameWithRetry(from, to) {
   }
 }
 
-function atomicWrite(file, data) {
+export function atomicWrite(file, data) {
   const tmp = `${file}.${process.pid}.${crypto.randomBytes(3).toString('hex')}.tmp`;
   fs.writeFileSync(tmp, data, 'utf8');
   try {
@@ -54,11 +55,19 @@ export function readMessage(id, paths = busPaths()) {
 }
 
 export function updateMessage(id, patch, paths = busPaths()) {
-  const current = readMessage(id, paths);
-  if (!current) throw new Error(`消息不存在: ${id}`);
-  const next = { ...current, ...patch, updatedAt: new Date().toISOString() };
-  atomicWrite(messageFile(id, paths), JSON.stringify(next, null, 2));
-  return next;
+  return withMessage(id, (_message, save) => save(patch), paths);
+}
+
+export function withMessage(id, action, paths = busPaths()) {
+  return withLock('message-' + id, () => {
+    const current = readMessage(id, paths);
+    if (!current) throw new Error(`消息不存在: ${id}`);
+    return action(current, patch => {
+      const next = { ...current, ...patch, updatedAt: new Date().toISOString() };
+      atomicWrite(messageFile(id, paths), JSON.stringify(next, null, 2));
+      return next;
+    });
+  }, paths);
 }
 
 /**

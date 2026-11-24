@@ -25,6 +25,7 @@ agy（Google Antigravity CLI）和 Codex CLI 之间的**本地双向通信总线
 
 - `bus_ask` 入队后轮询到软超时（默认 90s，低于 MCP 客户端约 3 分钟的硬上限），超时就返回 `status=running`，**不杀后台**。
 - `bus_send` 立即返回，worker 在后台跑完。
+- 发往同一接收方、同一频道的消息按入队顺序执行。前一轮结束后，下一轮才读取会话；不同接收方或不同频道可以并行。
 - worker 是 `detached` 的，MCP 连接断开、客户端超时、会话被关掉都不影响它把结果写进 `bus_inbox` / `bus_status`。
 
 ## 已验证（全部实测）
@@ -97,7 +98,8 @@ node bin/bus.mjs cancel --id <msg_id>
 
 - `progress` 来自 codex 的 `item.started` 事件（命令、文件修改、MCP 工具调用）和 agy 的 `step_update`，最多保留 40 条，对外展示最近 10 条。
 - 状态机：`queued → running → done / failed / cancelled`（旧的 `answered` 读取时归一到 `done`）。
-- `bus_cancel` 会 `taskkill /T /F` 整棵进程树，worker 结束时会检查状态，不会把 `cancelled` 覆盖成 `done`。
+- 取完整答案用 `wait` 或 `watch`：两者保留原文换行和缩进。`status` 用于看进度，只带回复预览（最多 800 字符加省略号）。
+- 同一 MCP 连接正在 `bus_ask` 或 `bus_wait` 时，仍可查询和取消。取消排队中的任务会跳过这一轮；取消执行中的任务会终止对端进程树，退出后频道继续处理下一条。完成和取消以先写入的终态为准。
 
 ## 多项目隔离
 
@@ -145,7 +147,7 @@ node bin\bus.mjs ask --from agy --to codex --new-session "新话题"
 |---|---|
 | `bus_ask` | 短问答，软超时返回 `running` 而不是被杀 |
 | `bus_send` | 异步排队，后台跑，立即返回 |
-| `bus_wait` | 分段等待已有任务，超时返回 `running` 不算错误 |
+| `bus_wait` | 完成时返回完整回复；超时返回当前状态（`queued` 或 `running`） |
 | `bus_cancel` | 取消任务并杀进程树 |
 | `bus_inbox` | 读未读消息 / 回复 |
 | `bus_reply` | 按 id 线程化回复 |
@@ -220,6 +222,7 @@ node bin/bus.mjs set hooks onComplete "C:\path\hook.cmd"
 - `askSoftTimeoutSec`：`bus_ask` 的**软超时**，只影响调用方等待，不杀进程。**必须明显小于 MCP 客户端的硬超时**（约 180s），90s 是安全值。
 - `hooks.onComplete`：任务结束（done/failed/cancelled）时执行的命令，事件文件路径作为参数传入。事件同时写在 `~/.agent-bus/events/<msg_id>.json`。
 - `cwd` / `sandbox` / `model` / `effort`：透传给对应 CLI。
+- 布尔开关用 `true` 或 `false`。例如 `node bin/bus.mjs set agy skipPermissions false` 会保留 agy 的权限检查。旧配置中的字符串 `"true"` / `"false"` 也按布尔值读取。
 
 ## 完成通知（事件驱动）
 
@@ -253,12 +256,18 @@ node bin/bus.mjs set hooks onComplete "C:\path\hook.cmd"
 - **每次问答真实消耗额度**：codex 约 8–24k tokens/次，agy 约 9–12k/次。
 - **无鉴权、全明文**：`~/.agent-bus` 是普通 JSON；别往里丢密钥。
 
+## 运行测试
+
+`npm test` 在临时目录中启动 MCP、独立 worker 和模拟对端，验证频道顺序、取消、权限参数与完整回复，无需账号或模型额度。检查本机 MCP 配置用 `node test/mcp-smoke.mjs`；加 `--deep` 会向真实对端发送一条测试消息。
+
 ## 目录
 
 ```
 bin/bus.mjs             CLI
 bin/mcp.mjs             MCP stdio server（9 个工具）
 src/bus.mjs             核心：入队 / worker / 等待 / 取消 / 状态 / 钩子
+src/channel-queue.mjs   按接收方和频道维护待执行队列
+src/coordination.mjs    跨进程协调短时文件更新
 src/store.mjs           消息存储（原子写 + 目录扫描）
 src/config.mjs          配置、按 channel 的会话、CLI 探测与自愈
 src/prompt.mjs          提示词包装、背景注入、argv 截断
@@ -267,5 +276,6 @@ src/transport/agy.mjs   agy stream-json（init 即拿 conversation id）
 src/transcript.mjs      按 thread id 定位 rollout 并读出对话
 src/spawn.mjs           进程启动、行级回调、超时、杀进程树
 test/mcp-smoke.mjs      MCP 协议级冒烟测试（含软超时 → wait 全链路）
+test/offline.mjs        离线回归与临时工作区
 test/hook.cmd           完成钩子示例
 ```

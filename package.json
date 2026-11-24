@@ -16,7 +16,7 @@
     "init": "node bin/bus.mjs init",
     "doctor": "node bin/bus.mjs doctor",
     "install-bus": "node bin/bus.mjs install",
-    "test": "node test/mcp-smoke.mjs"
+    "test": "node test/mcp-smoke.mjs --offline"
   },
   "engines": {
     "node": ">=20"

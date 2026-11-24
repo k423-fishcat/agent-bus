@@ -8,7 +8,7 @@ export function killTree(pid) {
     return;
   }
   try {
-    process.kill(pid, 'SIGKILL');
+    process.kill(-pid, 'SIGKILL');
   } catch {
     /* already gone */
   }
@@ -21,13 +21,14 @@ export function killTree(pid) {
  * `onStdoutLine` fires as each line arrives, which lets transports persist a
  * session id or progress note while the child is still running.
  */
-export function runProcess({ bin, args, cwd, input, timeoutMs = 240000, env, onStdoutLine, onStderrText }) {
-  return new Promise((resolve) => {
+export function runProcess({ bin, args, cwd, input, timeoutMs = 240000, env, onSpawn, onStdoutLine, onStderrText }) {
+  return new Promise((resolve, reject) => {
     const started = Date.now();
     let stdout = '';
     let stderr = '';
     let timedOut = false;
     let settled = false;
+    let setupError;
 
     let child;
     try {
@@ -35,6 +36,7 @@ export function runProcess({ bin, args, cwd, input, timeoutMs = 240000, env, onS
         cwd,
         env: { ...process.env, ...env },
         windowsHide: true,
+        detached: process.platform !== 'win32',
         stdio: ['pipe', 'pipe', 'pipe'],
         // .cmd/.bat shims need a shell; real .exe binaries must not get one.
         shell: /\.(cmd|bat)$/i.test(bin)
@@ -48,6 +50,7 @@ export function runProcess({ bin, args, cwd, input, timeoutMs = 240000, env, onS
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (setupError) return reject(setupError);
       resolve({ code, stdout, stderr, timedOut, durationMs: Date.now() - started });
     };
 
@@ -87,7 +90,17 @@ export function runProcess({ bin, args, cwd, input, timeoutMs = 240000, env, onS
     });
     child.on('close', (code) => finish(code));
 
+    try {
+      if (child.pid) onSpawn?.(child.pid);
+    } catch (error) {
+      setupError = error;
+      killTree(child.pid);
+      child.stdin?.destroy();
+      return;
+    }
     if (child.stdin) {
+      // Cancellation can close the peer between spawn and the prompt write.
+      child.stdin.on('error', err => { if (err.code !== 'EPIPE') stderr += String(err); });
       if (input != null) child.stdin.write(input);
       child.stdin.end();
     }

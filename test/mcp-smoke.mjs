@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 // Protocol-level smoke test: drives the MCP server exactly like Codex/agy will.
-// Usage: node test/mcp-smoke.mjs [--agent codex] [--to agy] [--deep]
+// Usage: node test/mcp-smoke.mjs [--agent codex] [--to agy] [--offline | --deep]
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { offlineHome, cleanupHome, regressions } from './offline.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const MCP = path.join(ROOT, 'bin', 'mcp.mjs');
@@ -13,12 +14,15 @@ const flag = (name, fallback) => {
   const index = args.indexOf(name);
   return index !== -1 && args[index + 1] ? args[index + 1] : fallback;
 };
-const AGENT = flag('--agent', 'codex');
-const PEER = flag('--to', AGENT === 'codex' ? 'agy' : 'codex');
 const DEEP = args.includes('--deep');
+const OFFLINE = args.includes('--offline') && !DEEP;
+const AGENT = flag('--agent', OFFLINE ? 'agy' : 'codex');
+const PEER = flag('--to', AGENT === 'codex' ? 'agy' : 'codex');
+const home = OFFLINE ? offlineHome() : null;
 
 const child = spawn(process.execPath, [MCP, '--agent', AGENT], {
   stdio: ['pipe', 'pipe', 'inherit'],
+  env: home ? { ...process.env, AGENT_BUS_HOME: home, AGENT_BUS_DEPTH: '0' } : process.env,
   windowsHide: true
 });
 
@@ -105,10 +109,14 @@ try {
   if (!missing.length) pass('tools/list', names.join(','));
   else fail('tools/list', `缺少 ${missing.join(',')}；实际 ${names.join(',')}`);
 
-  const peers = textOf(await request('tools/call', { name: 'bus_peers', arguments: {} }));
+  const peerResult = await request('tools/call', { name: 'bus_peers', arguments: {} });
+  if (peerResult.isError) throw new Error(textOf(peerResult));
+  const peers = textOf(peerResult);
   pass('bus_peers', peers.replace(/\s+/g, ' ').slice(0, 160));
 
-  if (DEEP) {
+  if (OFFLINE) {
+    await regressions(home, request, pass);
+  } else if (DEEP) {
     // Soft-timeout path: 1s deadline means the ask must come back "running",
     // then bus_wait must settle it without losing the worker.
     const first = textOf(
@@ -128,8 +136,9 @@ try {
     else fail('bus_wait', waited.slice(0, 400));
   }
 } catch (err) {
-  fail('smoke', err.message);
+  fail('smoke', err.stack || err.message);
 } finally {
   child.stdin.end();
+  if (home) await cleanupHome(home);
   child.kill();
 }

@@ -9,6 +9,7 @@ import {
   defaultConfig,
   loadConfig,
   saveConfig,
+  parseSetting,
   ensureDirs,
   loadSession,
   listChannels
@@ -439,12 +440,9 @@ async function main() {
       const value = valueParts.join(' ');
       const cfg = loadConfig();
       const scope = agent === 'defaults' || agent === 'hooks' ? agent : null;
-      if (scope) {
-        cfg[scope][key] = value === 'null' ? null : /^\d+$/.test(value) ? Number(value) : value;
-      } else {
-        if (!cfg.agents[agent]) throw new Error(`未知 agent: ${agent}`);
-        cfg.agents[agent][key] = value === 'null' ? null : /^\d+$/.test(value) ? Number(value) : value;
-      }
+      const target = scope ? cfg[scope] : cfg.agents[agent];
+      if (!target) throw new Error(`未知 agent: ${agent}`);
+      target[key] = parseSetting(scope || 'agent', key, value);
       saveConfig(cfg);
       out(`已设置 ${agent}.${key} = ${scope ? cfg[scope][key] : cfg.agents[agent][key]}`);
       return undefined;

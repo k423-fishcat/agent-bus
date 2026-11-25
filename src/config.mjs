@@ -5,7 +5,10 @@ import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 
 export const VERSION = '0.2.0';
-export const DEFAULT_TIMEOUT_SEC = 240;
+// Multi-file edits plus a Rust/frontend build or test suite routinely take
+// 4–8 minutes with xhigh reasoning. The worker limit is a hard kill, so the
+// default leaves room for that while run_timeout_sec can still override it.
+export const DEFAULT_TIMEOUT_SEC = 900;
 export const DEFAULT_ASK_SOFT_TIMEOUT_SEC = 90;
 
 export function busHome() {
@@ -30,6 +33,7 @@ export function ensureDirs(paths = busPaths()) {
 }
 
 export function defaultConfig({ cwd = process.cwd() } = {}) {
+  const claude = defaultClaudeAgent(cwd);
   return {
     version: 1,
     createdAt: new Date().toISOString(),
@@ -46,6 +50,8 @@ export function defaultConfig({ cwd = process.cwd() } = {}) {
         // Disable agent-bus MCP inside peer turns to prevent recursion while allowing other MCPs.
         disableSelfMcp: true,
         model: null,
+        effort: null,
+        serviceTier: null,
         timeoutSec: DEFAULT_TIMEOUT_SEC,
         // Optional: a thread the bus may notify through `codex queue`.
         liveThread: null
@@ -59,7 +65,8 @@ export function defaultConfig({ cwd = process.cwd() } = {}) {
         timeoutSec: DEFAULT_TIMEOUT_SEC,
         // Optional: reserved for Cascade language-server push (not enabled).
         liveConversation: null
-      }
+      },
+      ...(claude ? { claude } : {})
     },
     defaults: {
       delivery: 'peer',
@@ -74,6 +81,11 @@ export function defaultConfig({ cwd = process.cwd() } = {}) {
       onComplete: null
     }
   };
+}
+
+export function defaultClaudeAgent(cwd) {
+  const bin = detectClaudeBin();
+  return bin ? { kind: 'claude', bin, cwd, model: null, effort: null, timeoutSec: DEFAULT_TIMEOUT_SEC } : null;
 }
 
 const AGENT_SWITCHES = ['trust', 'disableSelfMcp', 'skipPermissions'];
@@ -134,6 +146,7 @@ function healAgentBins(cfg, paths) {
     let detected = null;
     if (agent.kind === 'codex') detected = detectCodexBin();
     else if (agent.kind === 'agy') detected = detectAgyBin();
+    else if (agent.kind === 'claude') detected = detectClaudeBin();
     if (!detected || detected === agent.bin) continue;
     agent.bin = detected;
     changed = true;
@@ -227,9 +240,28 @@ export function listChannels(agentName, paths = busPaths()) {
 }
 
 function whereAll(name) {
-  const res = spawnSync('where', [name], { encoding: 'utf8', windowsHide: true });
+  const res = spawnSync(process.platform === 'win32' ? 'where.exe' : 'which', process.platform === 'win32' ? [name] : ['-a', name], {
+    encoding: 'utf8', windowsHide: true
+  });
   if (res.status !== 0 || !res.stdout) return [];
   return res.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+}
+
+export function detectClaudeBin() {
+  const override = process.env.CLAUDE_BIN;
+  if (override && fs.existsSync(override) && !/\.(cmd|bat|ps1)$/i.test(override)) return path.resolve(override);
+  const onPath = whereAll('claude');
+  if (process.platform !== 'win32') return onPath[0] || null;
+
+  const native = onPath.find(file => /\.exe$/i.test(file));
+  if (native) return native;
+  // npm exposes Windows shims, but ships the launchable native binary in bin/.
+  const npmPrefixes = [...onPath.map(file => path.dirname(file)), path.join(process.env.APPDATA || os.homedir(), 'npm')];
+  const candidates = [
+    path.join(os.homedir(), '.local', 'bin', 'claude.exe'),
+    ...npmPrefixes.map(dir => path.join(dir, 'node_modules', '@anthropic-ai', 'claude-code', 'bin', 'claude.exe'))
+  ];
+  return candidates.find(file => fs.existsSync(file)) || null;
 }
 
 /**

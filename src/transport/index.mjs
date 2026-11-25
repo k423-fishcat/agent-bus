@@ -1,9 +1,11 @@
 import { runCodex } from './codex.mjs';
 import { runAgy } from './agy.mjs';
+import { runClaude } from './claude.mjs';
 
 const TRANSPORTS = {
   codex: runCodex,
-  agy: runAgy
+  agy: runAgy,
+  claude: runClaude
 };
 
 export function transportFor(agent) {

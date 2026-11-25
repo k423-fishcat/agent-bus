@@ -3,7 +3,7 @@
   "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "Local bidirectional message bus between Google Antigravity CLI (agy) and OpenAI Codex CLI",
+  "description": "Local message bus for Claude Code, OpenAI Codex, and Google Antigravity CLI (agy)",
   "license": "MIT",
   "repository": {
     "type": "git",

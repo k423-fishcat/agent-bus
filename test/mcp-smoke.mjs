@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Protocol-level smoke test: drives the MCP server exactly like Codex/agy will.
+// Protocol-level smoke test for agent-bus MCP clients.
 // Usage: node test/mcp-smoke.mjs [--agent codex] [--to agy] [--offline | --deep]
 import path from 'node:path';
 import { spawn } from 'node:child_process';
@@ -16,7 +16,7 @@ const flag = (name, fallback) => {
 };
 const DEEP = args.includes('--deep');
 const OFFLINE = args.includes('--offline') && !DEEP;
-const AGENT = flag('--agent', OFFLINE ? 'agy' : 'codex');
+const AGENT = flag('--agent', OFFLINE ? 'claude' : 'codex');
 const PEER = flag('--to', AGENT === 'codex' ? 'agy' : 'codex');
 const home = OFFLINE ? offlineHome() : null;
 
@@ -115,7 +115,7 @@ try {
   pass('bus_peers', peers.replace(/\s+/g, ' ').slice(0, 160));
 
   if (OFFLINE) {
-    await regressions(home, request, pass);
+    await regressions(home, request, pass, AGENT);
   } else if (DEEP) {
     // Soft-timeout path: 1s deadline means the ask must come back "running",
     // then bus_wait must settle it without losing the worker.

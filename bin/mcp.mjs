@@ -4,10 +4,12 @@ import path from 'node:path';
 import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { VERSION, busPaths } from '../src/config.mjs';
-import { ask, send, inbox, reply, peers, statusView, wait, cancel } from '../src/bus.mjs';
+import { ask, send, inbox, reply, peers, statusView, wait, cancel, MAX_RUN_TIMEOUT_SEC } from '../src/bus.mjs';
+import { formatInboxMessage, formatStatus } from '../src/status-format.mjs';
 import { printCodexTranscript } from '../src/transcript.mjs';
 
 const BUS_CLI = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 'bus.mjs');
+const backgroundWatch = id => `node "${BUS_CLI}" watch --id ${id} --allow-failure --summary`;
 
 const AGENT = (() => {
   const index = process.argv.indexOf('--agent');
@@ -43,11 +45,11 @@ const TOOLS = [
       'Send a SHORT question to the peer agent and wait for its answer (default soft timeout 90s, below the MCP client limit). ' +
       'Use only when the peer is expected to answer within 1-2 minutes. For code changes, refactors, running tests or anything ' +
       'that can take longer, use bus_send instead. On soft timeout it returns status=running without killing the worker: keep ' +
-      'the message_id and poll bus_wait / bus_status, or read the answer from bus_inbox later.',
+      'the message_id and end this turn unless the user wants to wait. Use the returned background watch command or check the result later.',
     inputSchema: {
       type: 'object',
       properties: {
-        to: { type: 'string', description: 'Peer agent name, e.g. "agy" or "codex".' },
+        to: { type: 'string', description: 'Target peer: "codex", "claude" (Claude Code), or "agy", if configured.' },
         text: { type: 'string', description: 'The message/question to send.' },
         soft_timeout_sec: { type: 'number', description: 'How long to wait before returning status=running (default 90).' },
         session: { type: 'string', description: 'Specific peer session to continue (Codex thread id / agy conversation id).' },
@@ -59,6 +61,18 @@ const TOOLS = [
         cwd: {
           type: 'string',
           description: 'Project working directory for this turn. Always pass this for project work so sessions auto-isolate per project.'
+        },
+        model: {
+          type: 'string',
+          description: 'Model ID accepted by the target CLI. Omit to use the peer default.'
+        },
+        effort: {
+          type: 'string',
+          description: 'Optional reasoning effort override for this turn (e.g. "xhigh", "high", "medium", "low"). Omit to use the peer default.'
+        },
+        service_tier: {
+          type: 'string',
+          description: 'Optional Codex service tier override for this turn ("fast"/"priority", "standard"/"default", "flex"). Omit to use the peer default.'
         },
         context_from_thread: {
           type: 'string',
@@ -72,15 +86,22 @@ const TOOLS = [
     name: 'bus_send',
     description:
       'Queue work for the peer and return immediately. Use this for development tasks, file edits, test runs, or anything that ' +
-      'may take more than a minute. The peer runs in a detached worker, so it survives this request ending. For non-blocking ' +
-      'reactive wakeup (without keeping the current turn busy), run the returned `bus.mjs watch --id <message_id>` command as a ' +
-      'background shell task and end your turn immediately — it exits as soon as the peer finishes. Otherwise check with ' +
-      'bus_wait / bus_status / bus_inbox.',
+      'may take more than a minute. For multi-step work and test suites, pass run_timeout_sec (e.g. 900). The detached worker ' +
+      'survives this request ending. Run the returned watch command as a background shell task for a short completion receipt, ' +
+      'then end your turn. Do not poll while work is running. Use bus_wait with the message ID for the original reply when needed.',
     inputSchema: {
       type: 'object',
       properties: {
-        to: { type: 'string', description: 'Peer agent name.' },
+        to: { type: 'string', description: 'Target peer: "codex", "claude" (Claude Code), or "agy", if configured.' },
         text: { type: 'string', description: 'The task or message to queue.' },
+        reply_format: {
+          type: 'string', enum: ['full', 'summary'],
+          description: 'Use summary for a short structured acceptance result: outcome, blockers, verification, next step, and changed paths. Default: full.'
+        },
+        run_timeout_sec: {
+          type: 'integer', minimum: 1, maximum: MAX_RUN_TIMEOUT_SEC,
+          description: 'Hard time limit for this task in seconds (e.g. 900 for longer work). Starts at peer launch, excludes queue time, and does not block the caller. Omit to use the configured peer limit.'
+        },
         session: { type: 'string', description: 'Specific peer session to continue.' },
         new_session: { type: 'boolean', description: 'Start a brand-new peer thread.' },
         channel: {
@@ -90,6 +111,18 @@ const TOOLS = [
         cwd: {
           type: 'string',
           description: 'Project working directory for this turn. Always pass this for project work so sessions auto-isolate per project.'
+        },
+        model: {
+          type: 'string',
+          description: 'Model ID accepted by the target CLI. Omit to use the peer default.'
+        },
+        effort: {
+          type: 'string',
+          description: 'Optional reasoning effort override for this turn (e.g. "xhigh", "high", "medium", "low"). Omit to use the peer default.'
+        },
+        service_tier: {
+          type: 'string',
+          description: 'Optional Codex service tier override for this turn ("fast"/"priority", "standard"/"default", "flex"). Omit to use the peer default.'
         },
         context_from_thread: { type: 'string', description: 'Copy a Codex thread transcript into a new bus thread. Cannot be combined with session.' }
       },
@@ -121,10 +154,15 @@ const TOOLS = [
   },
   {
     name: 'bus_inbox',
-    description: 'Read unread messages and peer replies addressed to you.',
+    description: 'Read unread messages and task results (including failure and cancellation). Pass channel or cwd to scope results.',
     inputSchema: {
       type: 'object',
-      properties: { limit: { type: 'number', description: 'Max messages to return (default 20).' } }
+      properties: {
+        limit: { type: 'number', description: 'Max matching messages to return (default 20).' },
+        channel: { type: 'string', description: 'Only messages on this channel.' },
+        cwd: { type: 'string', description: 'Only messages for this absolute workspace path. Combines with channel if both are set.' },
+        summary: { type: 'boolean', description: 'Show short receipts without marking them read. Use bus_wait by task ID for details.' }
+      }
     }
   },
   {
@@ -146,7 +184,7 @@ const TOOLS = [
   },
   {
     name: 'bus_status',
-    description: 'Inspect one message: state, elapsed time, session, recent progress, reply preview, error. Use bus_wait for the full reply.',
+    description: 'Inspect state, execution limit, time remaining, cwd, session, recent progress, reply preview, and errors. Use bus_wait for the full reply.',
     inputSchema: {
       type: 'object',
       properties: { message_id: { type: 'string' } },
@@ -169,24 +207,6 @@ const TOOLS = [
   }
 ];
 
-function formatStatus(view) {
-  const lines = [
-    `message_id : ${view.id}`,
-    `state      : ${view.state}`,
-    `from -> to : ${view.from} -> ${view.to} (${view.channel})`,
-    `session    : ${view.session || '-'}`,
-    `elapsed    : ${view.elapsedMs != null ? `${Math.round(view.elapsedMs / 1000)}s` : '-'}`
-  ];
-  if (view.reply) lines.push('', `reply:\n${view.reply}`);
-  if (view.error) lines.push('', `error (${view.errorCode || 'error'}): ${view.error}`);
-  if (view.hint) lines.push(`hint: ${view.hint}`);
-  if (view.progress?.length) {
-    lines.push('', 'progress:');
-    for (const entry of view.progress) lines.push(`  - ${entry.note}`);
-  }
-  return lines.join('\n');
-}
-
 async function callTool(name, args) {
   if (!AGENT) {
     return textResult('agent-bus 未配置 agent 身份：启动参数缺少 --agent，或环境变量 AGENT_BUS_AGENT 未设置。', true);
@@ -206,6 +226,9 @@ async function callTool(name, args) {
         newSession: Boolean(args.new_session),
         channel: args.channel,
         cwd: args.cwd,
+        model: args.model,
+        effort: args.effort,
+        serviceTier: args.service_tier,
         contextFromThread: args.context_from_thread
       });
 
@@ -218,14 +241,17 @@ async function callTool(name, args) {
         return textResult(
           [
             `[${args.to} 仍在执行] 已等待 ${Math.round((result.elapsedMs || 0) / 1000)}s，后台未中断。`,
-            `message_id=${result.messageId}  session=${result.session || '-'}`,
-            `非阻塞后台监听（完成后自动唤醒）: node "${BUS_CLI}" watch --id ${result.messageId}`,
-            '或用 bus_wait(message_id, timeout_sec) 继续等，或稍后 bus_status / bus_inbox 取结果。'
+            `message_id=${result.messageId}  channel=${result.channel}  session=${result.session || '-'}`,
+            `需要完成通知时，在后台运行：${backgroundWatch(result.messageId)}`,
+            '无需继续等待就结束本轮；错过通知时，按 channel 用 bus_inbox（summary: true）回收结果。'
           ].join('\n')
         );
       }
+      const location = result.errorCode === 'timeout'
+        ? `\nchannel=${result.channel}  cwd=${result.cwd || '-'}  session=${result.session || '-'}`
+        : '';
       return textResult(
-        `bus_ask ${result.status} (${args.to}): ${result.error}${result.hint ? `\n提示: ${result.hint}` : ''}\nmessage_id=${result.messageId}`,
+        `bus_ask ${result.status} (${args.to}): ${result.error}${result.hint ? `\n提示: ${result.hint}` : ''}\nmessage_id=${result.messageId}${location}`,
         true
       );
     }
@@ -235,19 +261,24 @@ async function callTool(name, args) {
         from: AGENT,
         to: args.to,
         text: args.text,
+        runTimeoutSec: args.run_timeout_sec,
+        replyFormat: args.reply_format,
         session: args.session,
         newSession: Boolean(args.new_session),
         channel: args.channel,
         cwd: args.cwd,
+        model: args.model,
+        effort: args.effort,
+        serviceTier: args.service_tier,
         contextFromThread: args.context_from_thread
       });
       return textResult(
         [
           `已排队给 ${args.to}（channel=${result.channel}）: message_id=${result.messageId}。`,
-          '后台运行，结束后结果进收件箱。',
-          `非阻塞后台监听（放到后台终端执行后即可结束当前回合，完成后自动唤醒）：`,
-          `  node "${BUS_CLI}" watch --id ${result.messageId}`,
-          '也可手动用 bus_status / bus_wait / bus_inbox 跟进。'
+          ...(result.runTimeoutSec == null ? [] : [`本次执行上限 ${result.runTimeoutSec}s，从对端启动时计时。`]),
+          'Codex 等对端在后台执行。需要完成通知时，把下面的命令作为后台 shell 任务运行，然后结束本轮：',
+          `  ${backgroundWatch(result.messageId)}`,
+          '错过通知可按 channel 用 bus_inbox（summary: true）；详情按 ID 调用 bus_wait。'
         ].join('\n')
       );
     }
@@ -266,14 +297,10 @@ async function callTool(name, args) {
     }
 
     case 'bus_inbox': {
-      const messages = inbox(AGENT, { limit: args.limit ? Number(args.limit) : 20 });
+      const summary = args.summary === true;
+      const messages = inbox(AGENT, { limit: args.limit ? Number(args.limit) : 20, channel: args.channel, cwd: args.cwd, summary });
       if (!messages.length) return textResult('没有未读消息。');
-      const body = messages
-        .map((message) => {
-          const meta = `id=${message.id} from=${message.from} at=${message.createdAt}${message.replyTo ? ` replyTo=${message.replyTo}` : ''}`;
-          return `--- ${meta}\n${message.text}`;
-        })
-        .join('\n\n');
+      const body = messages.map(message => formatInboxMessage(message, { summary, mcp: true })).join('\n\n');
       return textResult(body);
     }
 

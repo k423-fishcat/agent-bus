@@ -14,7 +14,8 @@ import {
 } from './config.mjs';
 import { newId, writeMessage, readMessage, updateMessage, listMessages, withMessage } from './store.mjs';
 import { channelQueue } from './channel-queue.mjs';
-import { buildPeerPrompt, formatBackground, excerpt } from './prompt.mjs';
+import { buildPeerPrompt, MAX_ARGV_PROMPT, excerpt } from './prompt.mjs';
+import { parseAcceptance } from './acceptance.mjs';
 import { runAgent } from './transport/index.mjs';
 import { readCodexTranscript } from './transcript.mjs';
 import { killTree } from './spawn.mjs';
@@ -23,6 +24,7 @@ const BUS_CLI = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..',
 const TERMINAL_STATES = new Set(['done', 'failed', 'cancelled', 'answered']);
 const PROGRESS_LIMIT = 40;
 const PROGRESS_THROTTLE_MS = 600;
+export const MAX_RUN_TIMEOUT_SEC = 3600;
 
 export function normalizeState(state) {
   return state === 'answered' ? 'done' : String(state || 'unknown');
@@ -59,6 +61,9 @@ export function peers() {
       kind: agent.kind,
       bin: agent.bin,
       cwd: agent.cwd,
+      model: agent.model || null,
+      effort: agent.effort || null,
+      serviceTier: agent.serviceTier || null,
       session: current.session,
       turns: current.turns,
       channels
@@ -84,12 +89,23 @@ export function createMessage({
   delivery = 'peer',
   channel = null,
   cwd = null,
+  model = null,
+  effort = null,
+  serviceTier = null,
   sessionOverride = null,
   newSession = false,
-  contextFromThread = null
+  contextFromThread = null,
+  replyFormat = 'full',
+  runTimeoutSec
 }) {
   if (contextFromThread && sessionOverride) {
     throw new Error('context_from_thread 会创建新会话，不能与 session 同时使用');
+  }
+  if (runTimeoutSec !== undefined && (!Number.isInteger(runTimeoutSec) || runTimeoutSec < 1 || runTimeoutSec > MAX_RUN_TIMEOUT_SEC)) {
+    throw new Error(`run_timeout_sec（--run-timeout）必须是 1～${MAX_RUN_TIMEOUT_SEC} 的整数秒`);
+  }
+  if (replyFormat !== 'full' && replyFormat !== 'summary') {
+    throw new Error('reply_format（--reply-format）必须是 full 或 summary');
   }
   return {
     id: newId('msg'),
@@ -100,6 +116,11 @@ export function createMessage({
     replyTo: null,
     channel: resolveChannel({ channel, cwd }),
     cwd: cwd || null,
+    runTimeoutSec: runTimeoutSec ?? null,
+    replyFormat,
+    model: model || null,
+    effort: effort || null,
+    serviceTier: serviceTier || null,
     contextFromThread: contextFromThread || null,
     createdAt: new Date().toISOString(),
     readAt: null,
@@ -214,7 +235,8 @@ function watchUntilSettled(id, timeoutMs = 0, fallbackPollMs = 1000) {
     };
 
     try {
-      watcher = fs.watch(eventsDir, (_eventType, filename) => {
+      // Windows notifications can use long names even when AGENT_BUS_HOME uses an 8.3 path.
+      watcher = fs.watch(fs.realpathSync.native(eventsDir), (_eventType, filename) => {
         if (!filename || filename === `${id}.json`) check();
       });
       watcher.on('error', () => {
@@ -244,13 +266,22 @@ function watchUntilSettled(id, timeoutMs = 0, fallbackPollMs = 1000) {
 }
 
 function consumeReplyCopy(message) {
-  const copies = listMessages({ to: message.from, limit: 200 }).filter(
-    (entry) => entry.replyTo === message.id && !entry.readAt
-  );
+  const copies = listMessages({ to: message.from, unreadOnly: true, filter: entry => entry.replyTo === message.id });
   for (const copy of copies) updateMessage(copy.id, { readAt: new Date().toISOString() });
 }
 
+function hasTerminalReceipt(message) {
+  return message.delivery === 'peer' && (message.state === 'failed' || message.state === 'cancelled');
+}
+
+function markTerminalReceiptRead(id) {
+  updateMessage(id, { receiptReadAt: new Date().toISOString() });
+}
+
 function mapError(result) {
+  if (result?.code === 'timeout') {
+    return { code: 'timeout', message: result.error, session: result.session };
+  }
   const text = `${result?.error || ''} ${result?.stderr || ''}`;
   if (/active writer|being written|another process|locked by|thread.*lock|in use by|already active|writer conflict/i.test(text)) {
     return {
@@ -261,7 +292,7 @@ function mapError(result) {
         '改用 --new-session 开新线程，或加 --context-from <该线程id> 把它的上下文读进来再问；也可以换一个 channel 隔离。'
     };
   }
-  if (/no rollout found|thread\/resume failed|no such session|session not found|unknown thread|could not find|cannot find session/i.test(text)) {
+  if (/no rollout found|thread\/resume failed|no such session|session not found|no conversation found with session id|unknown thread|could not find|cannot find session/i.test(text)) {
     return {
       code: 'session_not_found',
       message: `找不到指定会话：${result?.session || result?.threadId || result?.conversationId || '(未知 id)'}`,
@@ -280,18 +311,39 @@ function whileActive(id, action) {
   return withMessage(id, (message, save) => isTerminal(message) ? settledResult(message) : action(message, save));
 }
 
-function recordProgress(message, save, note, extra = {}) {
+const SUMMARY_FILES_LIMIT = 20;
+const SUMMARY_COMMANDS_LIMIT = 8;
+
+function summarizeStep(previous, step) {
+  const summary = previous || { filePatchCount: 0, files: [], commandCount: 0, commands: [] };
+  if (step.files) {
+    const files = new Set(summary.files);
+    for (const file of step.files) {
+      files.delete(file);
+      files.add(file);
+    }
+    return { ...summary, filePatchCount: summary.filePatchCount + 1, files: [...files].slice(-SUMMARY_FILES_LIMIT) };
+  }
+  return {
+    ...summary,
+    commandCount: summary.commandCount + 1,
+    commands: [...summary.commands, step.command].slice(-SUMMARY_COMMANDS_LIMIT)
+  };
+}
+
+function recordProgress(message, save, note, { session, step } = {}) {
   const now = Date.now();
   const last = message.__lastProgressAt || 0;
   const progress = Array.isArray(message.progress) ? message.progress.slice() : [];
-  const isImportant = extra.session || progress.length === 0 || /开始|完成|失败|取消/.test(note);
+  const isImportant = session || step || progress.length === 0 || /开始|完成|失败|取消/.test(note);
 
   if (!isImportant && now - last < PROGRESS_THROTTLE_MS && progress.length >= PROGRESS_LIMIT) return;
   if (!isImportant && now - last < PROGRESS_THROTTLE_MS && progress.at(-1)?.note === note) return;
 
   progress.push({ at: new Date(now).toISOString(), note: String(note).slice(0, 240) });
   save({
-    ...extra,
+    ...(session && { session }),
+    ...(step && { completedSteps: summarizeStep(message.completedSteps, step) }),
     progress: progress.slice(-PROGRESS_LIMIT),
     __lastProgressAt: now
   });
@@ -327,27 +379,74 @@ function emitEvent(event) {
 }
 
 async function buildBackground(message) {
-  if (!message.contextFromThread) return null;
+  if (!message.contextFromThread) return [];
   const { file, messages } = await readCodexTranscript(message.contextFromThread, { limit: 20 });
   if (!file) throw new Error(`找不到上下文来源会话: ${message.contextFromThread}`);
-  return formatBackground(messages);
+  return messages;
+}
+
+function peerPrompt(message, target, background) {
+  return buildPeerPrompt({
+    from: message.from,
+    to: message.to,
+    text: message.text,
+    threadId: message.threadId,
+    messageId: message.id,
+    background,
+    contextThread: message.contextFromThread,
+    replyFormat: message.replyFormat,
+    maxChars: target.kind === 'agy' ? MAX_ARGV_PROMPT : Infinity
+  });
+}
+
+function enqueueTask(target, fields) {
+  const message = createMessage(fields);
+  if (target.kind === 'agy') peerPrompt(message, target);
+  return enqueue(message);
+}
+
+function executionDetails(message) {
+  return {
+    channel: message.channel || 'default',
+    cwd: message.runCwd ?? message.cwd ?? null,
+    session: message.session || null,
+    runTimeoutSec: message.runTimeoutSec ?? null,
+    deadlineAt: message.deadlineAt ?? null
+  };
 }
 
 function failDelivery(id, mapped, durationMs = null) {
-  const failure = { state: 'failed', error: mapped.message, errorCode: mapped.code, hint: mapped.hint || null };
-  const message = whileActive(id, (_current, save) => save({ ...failure, peerPid: null, durationMs }));
-  if (message.alreadySettled) return message;
-  const { from, to, channel } = message;
-  logLine({ event: 'deliver_failed', id, from, to, code: mapped.code, durationMs });
-  emitEvent({
-    event: 'bus.task.failed', messageId: id, from, to, channel, state: 'failed',
-    code: mapped.code, error: mapped.message, durationMs, at: new Date().toISOString()
+  const message = whileActive(id, (current, save) => {
+    const timedOut = mapped.code === 'timeout';
+    const session = current.session || (timedOut ? mapped.session : null) || null;
+    const hint = !timedOut ? mapped.hint || null : session
+      ? '在同一 channel 和 cwd 用此 session 续跑；先核对已有修改和测试结果，只做剩余工作。'
+      : '未取得会话 ID。先在原工作目录核对已有修改和测试结果，再派发剩余工作。';
+    return save({ state: 'failed', error: mapped.message, errorCode: mapped.code, hint, session, peerPid: null, durationMs });
   });
-  return { ok: false, messageId: id, ...failure };
+  if (message.alreadySettled) return message;
+  const details = executionDetails(message);
+  logLine({ event: 'deliver_failed', id, from: message.from, to: message.to, code: mapped.code, durationMs });
+  emitEvent({
+    event: 'bus.task.failed', messageId: id, from: message.from, to: message.to, state: 'failed',
+    ...details, code: mapped.code, error: message.error, hint: message.hint, durationMs,
+    completedSteps: message.completedSteps ?? null, at: new Date().toISOString()
+  });
+  return { ok: false, messageId: id, state: 'failed', ...details, error: message.error, errorCode: message.errorCode, hint: message.hint };
 }
 
 function failAbandonedDelivery(id) {
   return failDelivery(id, { code: 'worker_exited', message: '投递 worker 已意外退出' });
+}
+
+function usageFields(source) {
+  return {
+    usage: source.usage ?? null,
+    ...(Object.hasOwn(source, 'sessionUsage') && {
+      sessionUsage: source.sessionUsage,
+      reportedUsage: source.reportedUsage
+    })
+  };
 }
 
 async function deliverMessage(message) {
@@ -356,24 +455,26 @@ async function deliverMessage(message) {
   const channel = sanitizeChannel(message.channel || 'default');
   const previous = loadSession(message.to, channel);
   const useSession = message.newSession || message.contextFromThread ? null : message.sessionOverride || previous.session;
-  const agent = { ...target, cwd: message.cwd || target.cwd };
-  const timeoutMs = (target.timeoutSec || cfg.defaults.timeoutSec) * 1000;
+  const agent = {
+    ...target,
+    cwd: message.cwd || target.cwd,
+    model: message.model || target.model,
+    effort: message.effort || target.effort,
+    serviceTier: message.serviceTier || target.serviceTier
+  };
+  const runTimeoutSec = Number(message.runTimeoutSec ?? (target.timeoutSec || cfg.defaults.timeoutSec));
+  const timeoutMs = runTimeoutSec * 1000;
 
-  const background = await buildBackground(message);
-  const prompt = buildPeerPrompt({
-    from: message.from,
-    to: message.to,
-    text: message.text,
-    threadId: message.threadId,
-    messageId: message.id,
-    background,
-    contextThread: message.contextFromThread
-  });
+  const prompt = peerPrompt(message, target, await buildBackground(message));
 
   const claim = whileActive(message.id, (_current, save) => save({
     state: 'running',
     pid: process.pid,
     peerPid: null,
+    runCwd: path.resolve(agent.cwd || '.'),
+    runTimeoutSec,
+    deadlineAt: null,
+    completedSteps: null,
     startedAt: new Date().toISOString(),
     progress: [{ at: new Date().toISOString(), note: `派发给 ${message.to}（${channel}）` }]
   }));
@@ -393,8 +494,11 @@ async function deliverMessage(message) {
       timeoutMs,
       env: { AGENT_BUS_DEPTH: String(depth + 1) },
       allowForeignSession: Boolean(message.sessionOverride),
-      onSpawn: pid => {
-        const active = whileActive(message.id, (_current, save) => save({ peerPid: pid }));
+      onSpawn: (pid, deadlineMs) => {
+        const active = whileActive(message.id, (_current, save) => save({
+          peerPid: pid,
+          deadlineAt: new Date(deadlineMs).toISOString()
+        }));
         if (active.alreadySettled) killTree(pid);
       },
       onSession: (sessionId) => {
@@ -404,7 +508,7 @@ async function deliverMessage(message) {
           recordProgress(current, save, `会话已就绪: ${sessionId}`, { session: sessionId });
         });
       },
-      onProgress: note => note && whileActive(message.id, (current, save) => recordProgress(current, save, note))
+      onProgress: (note, step) => note && whileActive(message.id, (current, save) => recordProgress(current, save, note, { step }))
     });
   } catch (err) {
     result = { ok: false, error: String(err?.message || err) };
@@ -414,6 +518,7 @@ async function deliverMessage(message) {
   if (!result.ok) return failDelivery(message.id, mapError(result), durationMs);
 
   const session = result.session || useSession || null;
+  const acceptance = message.replyFormat === 'summary' ? parseAcceptance(result.text) : null;
   const replyMessage = {
     ...createMessage({
       from: message.to,
@@ -421,18 +526,21 @@ async function deliverMessage(message) {
       text: result.text,
       threadId: message.threadId,
       channel,
+      cwd: claim.runCwd,
       delivery: 'mailbox'
     }),
     replyTo: message.id,
     state: 'delivered',
     expectsReply: false,
-    session: session
+    session,
+    durationMs,
+    acceptance
   };
   const settled = whileActive(message.id, (current, save) => {
     if (session) persistSession(session);
     writeMessage(replyMessage);
     save({
-      state: 'done', reply: result.text, session, peerPid: null, usage: result.usage || null, durationMs,
+      state: 'done', reply: result.text, acceptance, session, peerPid: null, ...usageFields(result), durationMs,
       progress: [...(current.progress || []), { at: new Date().toISOString(), note: `完成，用时 ${Math.round(durationMs / 1000)}s` }].slice(-PROGRESS_LIMIT)
     });
   });
@@ -449,6 +557,7 @@ async function deliverMessage(message) {
     state: 'done',
     session,
     durationMs,
+    ...(acceptance && { outcome: acceptance.outcome }),
     replyPreview: excerpt(result.text, 200),
     at: new Date().toISOString()
   });
@@ -460,7 +569,7 @@ async function deliverMessage(message) {
     reply: result.text,
     session,
     durationMs,
-    usage: result.usage || null,
+    ...usageFields(result),
     truncatedInput: result.truncatedInput || false
   };
 }
@@ -470,24 +579,25 @@ async function deliverMessage(message) {
  * the MCP client's hard deadline. On soft timeout the caller gets a structured
  * "running" status while the detached worker keeps going.
  */
-export async function ask({ from, to, text, softTimeoutSec, session, newSession, channel, cwd, contextFromThread }) {
+export async function ask({ from, to, text, softTimeoutSec, session, newSession, channel, cwd, model, effort, serviceTier, contextFromThread }) {
   const cfg = loadConfig();
   agentOf(cfg, from);
-  agentOf(cfg, to);
+  const target = agentOf(cfg, to);
 
   const softMs = Number(softTimeoutSec || cfg.defaults.askSoftTimeoutSec) * 1000;
-  const message = enqueue(
-    createMessage({
-      from,
-      to,
-      text,
-      channel,
-      cwd,
-      sessionOverride: session,
-      newSession,
-      contextFromThread
-    })
-  );
+  const message = enqueueTask(target, {
+    from,
+    to,
+    text,
+    channel,
+    cwd,
+    model,
+    effort,
+    serviceTier,
+    sessionOverride: session,
+    newSession,
+    contextFromThread
+  });
 
   const settled = await waitForSettlement(message.id, softMs);
   const state = normalizeState(settled?.state);
@@ -502,11 +612,12 @@ export async function ask({ from, to, text, softTimeoutSec, session, newSession,
       reply: settled.reply,
       session: settled.session || null,
       durationMs: settled.durationMs,
-      usage: settled.usage || null
+      ...usageFields(settled)
     };
   }
 
   if (state === 'failed' || state === 'cancelled') {
+    if (hasTerminalReceipt(settled)) markTerminalReceiptRead(settled.id);
     return {
       ok: false,
       status: state,
@@ -514,7 +625,8 @@ export async function ask({ from, to, text, softTimeoutSec, session, newSession,
       threadId: message.threadId,
       error: settled?.error || (state === 'cancelled' ? '任务已被取消' : '执行失败'),
       errorCode: settled?.errorCode || null,
-      hint: settled?.hint || null
+      hint: settled?.hint || null,
+      ...executionDetails(settled)
     };
   }
 
@@ -524,25 +636,25 @@ export async function ask({ from, to, text, softTimeoutSec, session, newSession,
     status: 'running',
     messageId: message.id,
     threadId: message.threadId,
+    channel: view.channel,
     session: view.session,
     elapsedMs: view.elapsedMs,
     hint: '仍在执行，未中断。用 bus_wait 等待，或用 bus_status / bus_inbox 取结果。'
   };
 }
 
-export function send({ from, to, text, session, newSession, channel, cwd, contextFromThread }) {
+export function send({ from, to, text, session, newSession, channel, cwd, model, effort, serviceTier, contextFromThread, runTimeoutSec, replyFormat }) {
   const cfg = loadConfig();
   agentOf(cfg, from);
-  agentOf(cfg, to);
-  const message = enqueue(
-    createMessage({ from, to, text, channel, cwd, sessionOverride: session, newSession, contextFromThread })
-  );
+  const target = agentOf(cfg, to);
+  const message = enqueueTask(target, { from, to, text, channel, cwd, model, effort, serviceTier, sessionOverride: session, newSession, contextFromThread, runTimeoutSec, replyFormat });
   return {
     ok: true,
     status: 'queued',
     messageId: message.id,
     threadId: message.threadId,
-    channel: message.channel
+    channel: message.channel,
+    runTimeoutSec: message.runTimeoutSec
   };
 }
 
@@ -559,29 +671,12 @@ export async function watch({ messageId, timeoutSec = 0, consume = true }) {
 
   const state = normalizeState(settled.state);
   const terminal = isTerminal(settled);
-  if (terminal && consume && state === 'done') {
-    consumeReplyCopy(settled);
+  if (terminal && consume) {
+    if (state === 'done') consumeReplyCopy(settled);
+    else if (hasTerminalReceipt(settled)) markTerminalReceiptRead(settled.id);
   }
 
-  const startedAt = settled.startedAt ? Date.parse(settled.startedAt) : null;
-  const elapsedMs = settled.durationMs ?? (startedAt ? Date.now() - startedAt : null);
-
-  return {
-    id: settled.id,
-    state,
-    from: settled.from,
-    to: settled.to,
-    channel: settled.channel || 'default',
-    cwd: settled.cwd,
-    session: settled.session || null,
-    elapsedMs,
-    durationMs: settled.durationMs ?? null,
-    reply: settled.reply || null,
-    error: settled.error || null,
-    errorCode: settled.errorCode || null,
-    hint: settled.hint || null,
-    timedOut: !terminal
-  };
+  return { ...messageView(settled, true), timedOut: !terminal };
 }
 
 export async function deliverById(id) {
@@ -590,7 +685,7 @@ export async function deliverById(id) {
   return channelQueue(message).run(
     async () => {
       try { return await deliverMessage(message); }
-      catch (error) { return failDelivery(id, { code: 'worker_error', message: error.message }); }
+      catch (error) { return failDelivery(id, { code: error.code === 'prompt_too_long' ? error.code : 'worker_error', message: error.message }); }
     },
     () => {
       const current = readMessage(id);
@@ -607,6 +702,7 @@ export function cancel({ messageId, from }) {
       state: 'cancelled',
       cancelledAt: new Date().toISOString(),
       cancelledBy: from || null,
+      ...(current.state === 'running' && { hint: '如需重派，先在原目录核对已有修改和测试结果。' }),
       progress: [...(current.progress || []),
         { at: new Date().toISOString(), note: `已取消${from ? `（by ${from}）` : ''}` }].slice(-PROGRESS_LIMIT)
     });
@@ -638,43 +734,88 @@ export function statusView(messageId) {
 function messageView(message, fullReply = false) {
   const state = normalizeState(message.state);
   const startedAt = message.startedAt ? Date.parse(message.startedAt) : null;
-  const elapsedMs = message.durationMs ?? (startedAt ? Date.now() - startedAt : null);
+  const now = Date.now();
+  const elapsedMs = message.durationMs ?? (startedAt ? now - startedAt : null);
+  const remainingMs = state === 'running' && message.deadlineAt
+    ? Math.max(0, Date.parse(message.deadlineAt) - now)
+    : null;
 
   return {
     id: message.id,
     state,
     from: message.from,
     to: message.to,
-    channel: message.channel || 'default',
-    cwd: message.cwd,
-    session: message.session || null,
+    ...executionDetails(message),
+    remainingMs,
     createdAt: message.createdAt,
     startedAt: message.startedAt,
     elapsedMs,
     durationMs: message.durationMs ?? null,
     progress: (message.progress || []).slice(-10),
+    completedSteps: message.completedSteps ?? null,
+    ...(Object.hasOwn(message, 'sessionUsage') ? usageFields(message) : message.usage && { reportedUsage: message.usage }),
     reply: fullReply ? message.reply ?? null : message.reply ? excerpt(message.reply, 800) : null,
-    error: message.error || null,
-    errorCode: message.errorCode || null,
+    acceptance: message.acceptance ?? null,
+    error: message.error || (state === 'cancelled' ? '任务已取消' : null),
+    errorCode: message.errorCode || (state === 'cancelled' ? 'cancelled' : null),
     hint: message.hint || null,
     replyTo: message.replyTo
   };
 }
 
-/**
- * Kept for backwards compatibility with older call sites.
- */
-export function inbox(agent, { limit = 20 } = {}) {
+function platformKey(value) {
+  return process.platform === 'win32' ? value.toLowerCase() : value;
+}
+
+function mailboxCwd(message) {
+  const cwd = message.runCwd || message.cwd;
+  if (cwd || !message.replyTo) return cwd;
+  try {
+    const original = readMessage(message.replyTo);
+    return original?.runCwd || original?.cwd;
+  } catch {
+    return null;
+  }
+}
+
+export function inbox(agent, { limit = 20, channel, cwd, summary = false } = {}) {
   const cfg = loadConfig();
   agentOf(cfg, agent);
+  for (const [key, value] of Object.entries({ channel, cwd })) {
+    if (value !== undefined && (typeof value !== 'string' || !value.trim())) {
+      throw new Error(`inbox 的 ${key} 必须是非空字符串`);
+    }
+  }
 
-  const pending = listMessages({ to: agent, unreadOnly: true, limit: 200 }).filter(
-    (message) => message.state === 'delivered' || message.state === 'queued'
-  );
-
-  const selected = pending.slice(0, limit);
-  for (const message of selected) {
-    updateMessage(message.id, { readAt: new Date().toISOString() });
+  const channelKey = channel === undefined ? null : platformKey(sanitizeChannel(channel));
+  const cwdKey = cwd === undefined ? null : platformKey(path.resolve(cwd));
+  // Failure and cancellation are projected from the original task so there
+  // is no second write to lose or duplicate when the worker stops.
+  const selected = listMessages({
+    limit: Infinity,
+    filter: message => {
+      const incoming = message.to === agent && !message.readAt && ['delivered', 'queued'].includes(message.state);
+      const receipt = hasTerminalReceipt(message) && message.from === agent && !message.receiptReadAt;
+      if (!incoming && !receipt) return false;
+      if (channelKey !== null && platformKey(sanitizeChannel(message.channel)) !== channelKey) return false;
+      if (cwdKey === null) return true;
+      const actual = mailboxCwd(message);
+      return typeof actual === 'string' && platformKey(path.resolve(actual)) === cwdKey;
+    }
+  }).map(message => {
+    if (!hasTerminalReceipt(message)) return message;
+    return {
+      id: message.id, from: message.to, to: message.from, channel: message.channel,
+      createdAt: message.cancelledAt || message.updatedAt || message.createdAt,
+      terminalReceipt: messageView(message)
+    };
+  }).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))
+    .slice(0, Math.max(0, Math.min(200, limit)));
+  if (!summary) {
+    for (const message of selected) {
+      if (message.terminalReceipt) markTerminalReceiptRead(message.id);
+      else updateMessage(message.id, { readAt: new Date().toISOString() });
+    }
   }
   return selected;
 }
@@ -683,18 +824,24 @@ export function reply({ from, messageId, text }) {
   const { copy, event } = withMessage(messageId, (original, save) => {
     if (original.to !== from) throw new Error(`只能回复发给自己的消息（这条消息的收件人是 "${original.to}"）`);
     if (isTerminal(original)) throw new Error(`这条消息已结束: ${original.state}`);
-    const copy = {
-      ...createMessage({ from, to: original.from, text, threadId: original.threadId, channel: original.channel, delivery: 'mailbox' }),
-      replyTo: original.id, state: 'delivered', expectsReply: false
-    };
-    writeMessage(copy);
+    const acceptance = original.replyFormat === 'summary' ? parseAcceptance(String(text ?? '')) : null;
     const at = new Date().toISOString();
     const durationMs = original.startedAt ? Date.now() - Date.parse(original.startedAt) : null;
-    save({ state: 'done', reply: copy.text, repliedAt: at, durationMs });
+    const copy = {
+      ...createMessage({
+        from, to: original.from, text, threadId: original.threadId,
+        channel: original.channel, cwd: original.runCwd || original.cwd, delivery: 'mailbox'
+      }),
+      replyTo: original.id, state: 'delivered', expectsReply: false, acceptance, durationMs
+    };
+    writeMessage(copy);
+    save({ state: 'done', reply: copy.text, acceptance, repliedAt: at, durationMs });
     if (original.state === 'running') killTree(Object.hasOwn(original, 'peerPid') ? original.peerPid : original.pid);
     return { copy, event: {
       event: 'bus.task.completed', messageId, replyId: copy.id, from: original.from, to: original.to,
-      channel: original.channel, state: 'done', session: original.session, durationMs, replyPreview: excerpt(copy.text, 200), at
+      channel: original.channel, state: 'done', session: original.session, durationMs,
+      ...(acceptance && { outcome: acceptance.outcome }),
+      replyPreview: excerpt(copy.text, 200), at
     } };
   });
   logLine({ event: 'reply', id: messageId, from, to: copy.to, chars: copy.text.length });

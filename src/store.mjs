@@ -91,7 +91,7 @@ export function withMessage(id, action, paths = busPaths()) {
  * Newest-first scan. The store is a flat directory of small JSON files, which
  * keeps concurrent writers (one MCP server per agent) contention-free.
  */
-export function listMessages({ to, from, state, unreadOnly = false, limit = 50 } = {}, paths = busPaths()) {
+export function listMessages({ to, from, state, unreadOnly = false, limit = 50, filter } = {}, paths = busPaths()) {
   ensureDirs(paths);
   const files = fs
     .readdirSync(paths.messages)
@@ -109,6 +109,7 @@ export function listMessages({ to, from, state, unreadOnly = false, limit = 50 }
     if (from && msg.from !== from) continue;
     if (state && msg.state !== state) continue;
     if (unreadOnly && msg.readAt) continue;
+    if (filter && !filter(msg)) continue;
     messages.push(msg);
   }
 

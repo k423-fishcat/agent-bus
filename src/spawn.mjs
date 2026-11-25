@@ -21,7 +21,7 @@ export function killTree(pid) {
  * `onStdoutLine` fires as each line arrives, which lets transports persist a
  * session id or progress note while the child is still running.
  */
-export function runProcess({ bin, args, cwd, input, timeoutMs = 240000, env, onSpawn, onStdoutLine, onStderrText }) {
+export function runProcess({ bin, args, cwd, input, timeoutMs = 900000, env, onSpawn, onStdoutLine, onStderrText }) {
   return new Promise((resolve, reject) => {
     const started = Date.now();
     let stdout = '';
@@ -56,6 +56,7 @@ export function runProcess({ bin, args, cwd, input, timeoutMs = 240000, env, onS
       resolve({ code, stdout, stderr, timedOut, durationMs: Date.now() - started, spawnError });
     };
 
+    const deadlineMs = Date.now() + timeoutMs;
     const timer = setTimeout(() => {
       timedOut = true;
       killTree(child.pid);
@@ -93,7 +94,7 @@ export function runProcess({ bin, args, cwd, input, timeoutMs = 240000, env, onS
     child.on('close', (code) => finish(code));
 
     try {
-      if (child.pid) onSpawn?.(child.pid);
+      if (child.pid) onSpawn?.(child.pid, deadlineMs);
     } catch (error) {
       setupError = error;
       killTree(child.pid);

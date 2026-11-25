@@ -21,20 +21,69 @@ if (label === 'after-worker-exit') {
 }
 fs.appendFileSync(starts, JSON.stringify({ label, session, resume: resume >= 0, pid: process.pid, predecessorAlive, args, prompt }) + '\n');
 emit({ type: 'thread.started', thread_id: session });
+if (label === 'hold-budget-timeout') {
+  fs.writeFileSync(path.join(home, 'budget-checkpoint.txt'), 'partial work');
+  const patch = { id: 'completed-patch', type: 'file_change', changes: [
+    { path: path.join(process.cwd(), 'README.md'), kind: 'update' },
+    { path: 'test_explorer.py', kind: 'update' }
+  ] };
+  emit({ type: 'item.started', item: { ...patch, status: 'in_progress' } });
+  emit({ type: 'item.completed', item: { ...patch, status: 'completed' } });
+  emit({ type: 'item.completed', item: {
+    id: 'failed-patch', type: 'file_change', status: 'failed', changes: [{ path: 'unapplied.md', kind: 'update' }]
+  } });
+  const command = '"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -NoProfile -Command "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; $OutputEncoding = [Text.UTF8Encoding]::new(); npm test"';
+  emit({ type: 'item.completed', item: { id: 'tests', type: 'command_execution', command, status: 'completed', exit_code: 0 } });
+  emit({ type: 'item.completed', item: { id: 'gui', type: 'command_execution', command: 'start-demo.exe', status: 'failed', exit_code: 5 } });
+  for (let i = 0; i < 10; i += 1) {
+    emit({ type: 'item.started', item: { id: 'read-' + i, type: 'mcp_tool_call', server: 'fixture', tool: 'read_' + i } });
+  }
+  emit({ type: 'item.started', item: { id: 'stopped', type: 'command_execution', command: 'cargo test --workspace', status: 'in_progress' } });
+}
 if (label.startsWith('hold-')) {
   const release = path.join(home, 'release-' + label);
   while (!fs.existsSync(release) && !fs.existsSync(path.join(home, 'release-all'))) await delay(25);
 }
+const usage = {
+  'usage-fresh': { input_tokens: 1000, cached_input_tokens: 900, output_tokens: 100 },
+  'usage-resume': { input_tokens: 1250, cached_input_tokens: 1100, output_tokens: 121 },
+  'usage-unknown': { input_tokens: 1500, cached_input_tokens: 1280, output_tokens: 145 }
+}[label];
+if (usage && label !== 'usage-unknown') {
+  const dir = path.join(process.env.CODEX_HOME, 'sessions');
+  fs.mkdirSync(dir, { recursive: true });
+  const event = (type, fields) => ({ type: 'event_msg', payload: { type, ...fields } });
+  const counts = total_token_usage => event('token_count', { info: { total_token_usage } });
+  const user = text => ({ type: 'response_item', payload: { type: 'message', role: 'user', content: [{ text }] } });
+  const events = [event('task_started'), user(prompt)];
+  if (label === 'usage-resume') {
+    events.push(counts({ input_tokens: 1100, cached_input_tokens: 990, output_tokens: 110 }));
+    events.push({ type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ text: '测试'.repeat(30000) }] } });
+  }
+  events.push(counts(usage), event('task_complete'));
+  if (label === 'usage-resume') {
+    events.push(event('task_started'), user('another turn'), counts({
+      input_tokens: 9000, cached_input_tokens: 8000, output_tokens: 500
+    }), event('task_complete'));
+  }
+  fs.appendFileSync(path.join(dir, `rollout-${session}.jsonl`), events.map(e => JSON.stringify(e)).join('\n') + '\n');
+}
+
 if (label === 'fail') {
   emit({ type: 'turn.failed', error: { message: 'fixture failure' } });
 } else {
-  const text = label === 'hold-first' ? '代码：\n' + '    answer();\n'.repeat(100) + 'END' : label;
+  const text = label === 'hold-first' ? '代码：\n' + '    answer();\n'.repeat(100) + 'END'
+    : label === 'usage-resume' ? JSON.stringify({
+      outcome: 'partial', changes: 'src/demo.mjs ' + 'x'.repeat(750),
+      verification: '单测通过', blockers: '真实桌面截图未验证', next_step: '请在桌面会话验收'
+    })
+    : label;
   emit({ type: 'item.completed', item: { type: 'agent_message', text } });
   if (label === 'partial-failure') {
     emit({ type: 'turn.failed', error: { message: 'fixture failure after output' } });
   } else if (label === 'partial-nonzero') {
     process.exitCode = 1;
   } else {
-    emit({ type: 'turn.completed' });
+    emit({ type: 'turn.completed', usage });
   }
 }

@@ -1,5 +1,5 @@
 import { runProcess } from '../spawn.mjs';
-import { fitForArgv } from '../prompt.mjs';
+import { MAX_ARGV_PROMPT, promptTooLong } from '../prompt.mjs';
 
 function extractFinalJson(stdout) {
   const lines = stdout.split(/\r?\n/).filter((line) => line.trim().startsWith('{'));
@@ -29,7 +29,10 @@ export function agyArgs(agent, prompt, session) {
  * so the peer session can be persisted before the turn completes.
  */
 export async function runAgy(agent, { prompt, session, timeoutMs, env, onSpawn, onSession, onProgress }) {
-  const fitted = fitForArgv(prompt);
+  if (prompt.length > MAX_ARGV_PROMPT) {
+    const error = promptTooLong();
+    return { ok: false, code: error.code, error: error.message, conversationId: session || null };
+  }
 
   let conversationId = session || null;
   let final = null;
@@ -37,7 +40,7 @@ export async function runAgy(agent, { prompt, session, timeoutMs, env, onSpawn, 
 
   const res = await runProcess({
     bin: agent.bin,
-    args: agyArgs(agent, fitted.text, session),
+    args: agyArgs(agent, prompt, session),
     cwd: agent.cwd,
     timeoutMs,
     env,
@@ -115,7 +118,6 @@ export async function runAgy(agent, { prompt, session, timeoutMs, env, onSpawn, 
     text,
     conversationId: id,
     usage: payload.usage || null,
-    durationMs: res.durationMs,
-    truncatedInput: fitted.truncated
+    durationMs: res.durationMs
   };
 }

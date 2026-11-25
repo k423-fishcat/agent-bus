@@ -7,6 +7,7 @@ import {
   VERSION,
   busPaths,
   defaultConfig,
+  defaultClaudeAgent,
   loadConfig,
   saveConfig,
   parseSetting,
@@ -29,6 +30,7 @@ import {
   resetPeerSession
 } from '../src/bus.mjs';
 import { printCodexTranscript } from '../src/transcript.mjs';
+import { formatInboxMessage, formatReceipt, formatStatus, receiptView } from '../src/status-format.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const MCP_ENTRY = path.join(ROOT, 'bin', 'mcp.mjs');
@@ -47,7 +49,12 @@ const TAKE_VALUE = new Set([
   'thread',
   'channel',
   'soft-timeout',
-  'context-from'
+  'run-timeout',
+  'reply-format',
+  'context-from',
+  'model',
+  'effort',
+  'service-tier'
 ]);
 
 function parseArgs(argv) {
@@ -129,24 +136,39 @@ async function cmdInit(flags, positional) {
   ensureDirs(paths);
   saveConfig(config, paths);
   out(`初始化完成: ${paths.config}`);
-  out(`  codex.bin = ${config.agents.codex.bin}`);
-  out(`  agy.bin   = ${config.agents.agy.bin}`);
   out(`  workspace = ${cwd}`);
   for (const [name, agent] of Object.entries(config.agents)) {
-    out(`  ${name} 可执行文件存在: ${fs.existsSync(agent.bin) ? 'yes' : `NO (${agent.bin})`}`);
+    out(`  ${name}.bin = ${agent.bin} (${fs.existsSync(agent.bin) ? 'ok' : '未找到'})`);
   }
   out('');
-  out('下一步: node bin/bus.mjs install   # 把 bus 注册成两边都能用的 MCP server');
+  out('下一步: node bin/bus.mjs install --claude-only   # 在 Claude Code 中调用 Codex');
+  out('注册所有已配置的客户端: node bin/bus.mjs install');
+}
+
+function registrationResult(res) {
+  const body = `${res.stdout || ''}${res.stderr || ''}`.trim();
+  if (res.error || res.status !== 0) {
+    fail(`  注册失败: ${res.error?.message || body || `exit ${res.status}`}`);
+    return false;
+  }
+  if (body) out(`  ${body}`);
+  return true;
 }
 
 async function cmdInstall(flags) {
   const cfg = readConfigOrExit();
   if (!cfg) return;
 
-  const wantCodex = !flags.agy && !flags['agy-only'];
-  const wantAgy = !flags.codex && !flags['codex-only'];
+  const selected = ['codex', 'agy', 'claude'].filter(name => flags[`${name}-only`] || flags[name]);
+  if (selected.length > 1) throw new Error('每次只能选择一个 --codex-only、--agy-only 或 --claude-only');
+  const wants = name => !selected.length || selected.includes(name);
+  if (selected.length && selected[0] !== 'claude' && !cfg.agents[selected[0]]) {
+    fail(`未配置对端: ${selected[0]}`);
+    return;
+  }
+  const claude = wants('claude') && (cfg.agents.claude || defaultClaudeAgent(cfg.agents.codex?.cwd || process.cwd()));
 
-  if (wantCodex) {
+  if (wants('codex') && cfg.agents.codex) {
     const bin = cfg.agents.codex.bin;
     out(`[codex] 注册 MCP server: ${bin}`);
     spawnSync(bin, ['mcp', 'remove', 'agent-bus'], { encoding: 'utf8', windowsHide: true });
@@ -154,10 +176,10 @@ async function cmdInstall(flags) {
       encoding: 'utf8',
       windowsHide: true
     });
-    out(`  exit=${res.status} ${`${res.stdout || ''}${res.stderr || ''}`.trim().slice(0, 300)}`);
+    registrationResult(res);
   }
 
-  if (wantAgy) {
+  if (wants('agy') && cfg.agents.agy) {
     const bin = cfg.agents.agy.bin;
     out(`[agy] 注册 MCP server: ${bin}`);
     const res = spawnSync(
@@ -165,15 +187,28 @@ async function cmdInstall(flags) {
       ['mcp', 'add', '-e', 'AGENT_BUS_AGENT=agy', 'agent-bus', process.execPath, MCP_ENTRY],
       { encoding: 'utf8', windowsHide: true }
     );
-    out(`  exit=${res.status} ${`${res.stdout || ''}${res.stderr || ''}`.trim().slice(0, 300)}`);
+    registrationResult(res);
   }
 
-  out('');
-  out('[codex] mcp list:');
-  out(mcpList(cfg.agents.codex.bin).split(/\r?\n/).slice(0, 8).join('\n'));
-  out('');
-  out('[agy] mcp list:');
-  out(mcpList(cfg.agents.agy.bin).split(/\r?\n/).slice(0, 8).join('\n'));
+  if (claude) {
+    out(`[claude] 注册用户级 MCP server: ${claude.bin}`);
+    const args = ['mcp', 'add', '--scope', 'user', '--transport', 'stdio', 'agent-bus'];
+    if (process.env.AGENT_BUS_HOME) args.push('--env', `AGENT_BUS_HOME=${path.resolve(busPaths().home)}`);
+    args.push('--', process.execPath, MCP_ENTRY, '--agent', 'claude');
+    const res = spawnSync(claude.bin, args, { encoding: 'utf8', windowsHide: true, timeout: 30000 });
+    if (registrationResult(res) && !cfg.agents.claude) {
+      cfg.agents.claude = claude;
+      saveConfig(cfg);
+    }
+  } else if (selected.includes('claude')) {
+    fail('未找到 Claude Code 可执行文件；安装后重试，或通过 CLAUDE_BIN 指定原生可执行文件');
+  }
+
+  for (const name of ['codex', 'agy']) {
+    if (!wants(name) || !cfg.agents[name]) continue;
+    out(`\n[${name}] mcp list:`);
+    out(mcpList(cfg.agents[name].bin).split(/\r?\n/).slice(0, 8).join('\n'));
+  }
 }
 
 function cmdDoctor() {
@@ -203,10 +238,8 @@ function cmdDoctor() {
       }
     }
     out('');
-    for (const [label, bin] of [
-      ['codex', cfg.agents.codex?.bin],
-      ['agy', cfg.agents.agy?.bin]
-    ]) {
+    for (const label of ['codex', 'agy', 'claude']) {
+      const bin = cfg.agents[label]?.bin;
       if (!bin) continue;
       out(`[${label}] mcp list:`);
       out(
@@ -252,7 +285,10 @@ function printAskResult(result, flags) {
     err(`  node bin/bus.mjs wait --id ${result.messageId} --timeout 300`);
     return;
   }
-  fail(`[agent-bus] ${result.status}: ${result.error}${result.hint ? `\n  ${result.hint}` : ''}`);
+  const location = result.errorCode === 'timeout'
+    ? `\n  message_id=${result.messageId}  channel=${result.channel}  cwd=${result.cwd || '-'}  session=${result.session || '-'}`
+    : '';
+  fail(`[agent-bus] ${result.status}: ${result.error}${result.hint ? `\n  ${result.hint}` : ''}${location}`);
 }
 
 function channelFlag(flags) {
@@ -262,6 +298,9 @@ function channelFlag(flags) {
 async function main() {
   const [command, ...rest] = process.argv.slice(2);
   const { flags, positional } = parseArgs(rest);
+  if (flags['run-timeout'] !== undefined && command !== 'send') {
+    throw new Error('--run-timeout 仅用于 send');
+  }
 
   switch (command) {
     case 'init':
@@ -286,6 +325,9 @@ async function main() {
         text,
         channel: channelFlag(flags),
         cwd: flags.cwd ? path.resolve(flags.cwd) : undefined,
+        model: flags.model,
+        effort: flags.effort,
+        serviceTier: flags['service-tier'],
         session: flags.session,
         newSession: Boolean(flags['new-session']),
         contextFromThread: flags['context-from'],
@@ -299,17 +341,24 @@ async function main() {
       const from = requireFlag(flags, 'from');
       const to = requireFlag(flags, 'to');
       const text = textOf(flags, positional);
+      const limit = flags['run-timeout'];
       const result = send({
         from,
         to,
         text,
+        runTimeoutSec: typeof limit === 'string' && /^\d+$/.test(limit) ? Number(limit) : limit,
+        replyFormat: flags['reply-format'],
         channel: channelFlag(flags),
         cwd: flags.cwd ? path.resolve(flags.cwd) : undefined,
+        model: flags.model,
+        effort: flags.effort,
+        serviceTier: flags['service-tier'],
         session: flags.session,
         newSession: Boolean(flags['new-session']),
         contextFromThread: flags['context-from']
       });
       out(`已排队: ${result.messageId}  channel=${result.channel}`);
+      if (result.runTimeoutSec != null) out(`本次执行上限 ${result.runTimeoutSec}s，从对端启动时计时。`);
       out('回复会进入发件人收件箱；用 `bus.mjs inbox --agent <名字>` 或 `bus.mjs wait --id ...` 获取。');
       return undefined;
     }
@@ -323,29 +372,20 @@ async function main() {
 
     case 'watch': {
       const id = flags.id || positional[0];
-      if (!id) throw new Error('用法: bus.mjs watch --id <message-id> [--timeout 0] [--json] [--keep-unread]');
+      if (!id) throw new Error('用法: bus.mjs watch --id <message-id> [--summary] [--timeout 0] [--json] [--keep-unread] [--allow-failure]');
       const view = await watch({
         messageId: id,
         timeoutSec: flags.timeout !== undefined ? Number(flags.timeout) : 0,
-        consume: !flags['keep-unread']
+        consume: !flags['summary'] && !flags['keep-unread']
       });
-      if (flags.json) {
-        out(JSON.stringify(view, null, 2));
+      if (flags.summary) {
+        const receipt = receiptView(view);
+        out(flags.json ? JSON.stringify(receipt, null, 2) : formatReceipt(receipt));
       } else {
-        const lines = [
-          `message_id : ${view.id}`,
-          `state      : ${view.state}`,
-          `from -> to : ${view.from} -> ${view.to} (${view.channel})`,
-          `session    : ${view.session || '-'}`,
-          `elapsed    : ${view.elapsedMs != null ? `${Math.round(view.elapsedMs / 1000)}s` : '-'}`
-        ];
-        if (view.reply) lines.push('', `reply:\n${view.reply}`);
-        if (view.error) lines.push('', `error (${view.errorCode || 'error'}): ${view.error}`);
-        if (view.hint) lines.push(`hint: ${view.hint}`);
-        out(lines.join('\n'));
+        out(flags.json ? JSON.stringify(view, null, 2) : formatStatus(view));
       }
       if (view.timedOut) process.exitCode = 2;
-      else if (view.state !== 'done') process.exitCode = 1;
+      else if (view.state !== 'done' && !flags['allow-failure']) process.exitCode = 1;
       return undefined;
     }
 
@@ -357,16 +397,13 @@ async function main() {
 
     case 'inbox': {
       const agent = requireFlag(flags, 'agent');
-      const messages = inbox(agent, { limit: flags.limit ? Number(flags.limit) : 20 });
+      const summary = Boolean(flags.summary);
+      const messages = inbox(agent, { limit: flags.limit ? Number(flags.limit) : 20, channel: flags.channel, cwd: flags.cwd, summary });
       if (!messages.length) {
         out('（没有未读消息）');
         return undefined;
       }
-      for (const message of messages) {
-        out(`--- ${message.id}  from=${message.from}  ${message.createdAt}${message.replyTo ? `  replyTo=${message.replyTo}` : ''}`);
-        out(message.text);
-        out('');
-      }
+      out(messages.map(message => formatInboxMessage(message, { summary })).join('\n\n'));
       return undefined;
     }
 
@@ -469,25 +506,31 @@ async function main() {
     case undefined:
     case 'help':
     case '--help':
-      out(`agent-bus v${VERSION} — agy <-> Codex 本地双向通信
+      out(`agent-bus v${VERSION} — Claude Code / Codex / agy 本地通信
+
+在 Claude Code 中调用 Codex:
+  node bin/bus.mjs install --claude-only
+  node bin/bus.mjs ask --from claude --to codex --cwd <目录> "问题"
 
 同步问答（默认 90s 软超时，超时返回 running 但不中断后台）:
   node bin/bus.mjs ask --from codex --to agy "问题" [--soft-timeout 90] [--block]
 异步派发:
-  node bin/bus.mjs send --from agy --to codex "消息"
+  node bin/bus.mjs send --from claude --to codex "消息" [--run-timeout 900] [--reply-format summary]
+  --run-timeout <秒>  仅覆盖本次后台执行上限，不含排队时间
 观测与回收:
-  node bin/bus.mjs watch  --id msg_xxx [--timeout 0] [--json]   # 事件监听，直到任务结束再退出（适合后台唤醒）
+  node bin/bus.mjs watch  --id msg_xxx [--summary] [--timeout 0] [--json] [--keep-unread] [--allow-failure]
   node bin/bus.mjs wait   --id msg_xxx [--timeout 120]
   node bin/bus.mjs status <msg_xxx>
   node bin/bus.mjs cancel --id msg_xxx
-  node bin/bus.mjs inbox  --agent codex
+  node bin/bus.mjs inbox  --agent claude [--channel <频道>] [--cwd <目录>] [--summary]
 会话与项目隔离:
   --channel <项目名>  按 (peer, channel) 维护独立会话
   --cwd <目录>        本次执行的工作目录
+  --model <模型>      本次覆盖对端模型   --effort <强度>   --service-tier <fast|standard>
   --session <id>      指定已有会话   --new-session 开新会话
   --context-from <id> 把某线程上下文读进来（绕开前台写锁）
 其他:
-  init / install / doctor / peers / transcript / log / reset / set
+  init / install [--codex-only|--agy-only|--claude-only] / doctor / peers / transcript / log / reset / set
   node bin/bus.mjs transcript [--thread <id>] [-n 20]
   node bin/bus.mjs reset --agent codex [--channel proj]
 

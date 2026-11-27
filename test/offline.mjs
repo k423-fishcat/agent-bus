@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { Script } from 'node:vm';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -23,6 +24,38 @@ async function until(check, label, timeout = 10000) {
     if (Date.now() >= end) throw new Error('等待超时: ' + label);
     await delay(25);
   }
+}
+
+async function checkCommandWaitCell(prompt) {
+  const source = prompt.match(/^```js\r?\n(\/\/ @exec:[\s\S]*?)\r?\n```$/m)?.[1];
+  assert.ok(source, '后台 Codex 收到可执行的长命令等待模板');
+  const cell = new Script(`(async () => {\n${source}\n})()`);
+  const args = { cmd: 'fixture build', workdir: tmp };
+  async function run(first, pending = []) {
+    const output = [];
+    let starts = 0;
+    await cell.runInNewContext({ ARGS: args, text: chunk => output.push(chunk), tools: {
+      exec_command: async options => { assert.equal(options, args); starts++; return first; },
+      write_stdin: async ({ session_id, chars, yield_time_ms }) => {
+        assert.equal(session_id, 37);
+        assert.equal(chars, '');
+        assert.equal(yield_time_ms, 60000);
+        assert.ok(pending.length, '终态后不应再次查询');
+        return pending.shift();
+      }
+    } });
+    assert.equal(starts, 1);
+    assert.equal(pending.length, 0);
+    return output;
+  }
+  const done = { exit_code: 0, output: 'done' };
+  const denied = { status: 'rejected', reason: 'fixture denial' };
+  const failed = { session_id: 37, exit_code: 2, output: 'failed check' };
+  assert.deepEqual(await run(done), [done]);
+  assert.deepEqual(await run(denied), [denied]);
+  assert.deepEqual(await run({ session_id: 37, output: 'start' }, [
+    { session_id: 37, output: '' }, { session_id: 37, output: 'checkpoint' }, failed
+  ]), ['start', 'checkpoint', failed]);
 }
 
 export function offlineHome() {
@@ -77,6 +110,7 @@ export async function regressions(home, request, pass, caller) {
     return id;
   };
   const wait = id => tool('bus_wait', { message_id: id, timeout_sec: 5 });
+  const waitSummary = (id, timeout = 5) => tool('bus_wait', { message_id: id, timeout_sec: timeout, summary: true });
   const cancel = async id => JSON.parse(await tool('bus_cancel', { message_id: id }));
   const starts = () => {
     const file = path.join(home, 'starts.ndjson');
@@ -93,15 +127,38 @@ export async function regressions(home, request, pass, caller) {
   assert.equal(readMessage(answeredId, paths).from, caller);
   const turn = starts().find(s => s.label === 'caller-smoke');
   assert.match(turn.prompt, new RegExp(`Incoming message from peer agent "${caller}"`));
+  await checkCommandWaitCell(turn.prompt);
   assert.equal(turn.args[turn.args.indexOf('-m') + 1], 'fixture-model');
   assert.ok(turn.args.includes('model_reasoning_effort=high'));
   const queued = await send('caller-async', 'caller-smoke');
   assert.match(await wait(queued), /state\s+: done/);
+  assert.match(starts().find(s => s.label === 'caller-async').prompt, /tools\.write_stdin/);
   assert.equal(jsonCli('status', queued).runTimeoutSec, 15, '未指定时沿用对端配置');
   const inbox = await tool('bus_inbox', {});
   assert.ok(inbox.includes('replyTo=' + queued) && inbox.includes('caller-async'));
   assert.equal(loadSession('codex', 'caller-smoke', paths).session, turn.session);
   pass(`${caller} → Codex：MCP 问答、异步回复回收、续聊和模型覆盖`);
+
+  const quick = await tool('bus_send', { to: 'codex', channel: 'inline', text: 'quick-receipt', wait_for_receipt_sec: 5 });
+  assert.match(quick, /state=done[\s\S]*给用户的答复：已验证中文导出。[\s\S]*验证：中文回归用例通过/);
+  assert.doesNotMatch(quick, /watch --id|progress:/);
+  const quickId = quick.match(/message_id=(msg_\w+)/)[1];
+  assert.equal(readMessage(quickId, paths).replyFormat, 'summary');
+  assert.equal(listMessages({ filter: entry => entry.replyTo === quickId }, paths)[0].readAt, null);
+  const quickAudit = fs.readFileSync(path.join(paths.logs, 'mcp.log'), 'utf8').trim().split('\n').map(JSON.parse).at(-1);
+  assert.equal(quickAudit.responseChars, quick.length);
+  for (const seconds of [-1, 91, 0.5, '1', null]) {
+    const invalid = await request('tools/call', { name: 'bus_send',
+      arguments: { to: 'codex', text: 'invalid-receipt-window', wait_for_receipt_sec: seconds } });
+    assert.equal(invalid.isError, true);
+  }
+  assert.equal(listMessages({ filter: entry => entry.text === 'invalid-receipt-window' }, paths).length, 0);
+  const combined = cli('send', '--from', caller, '--to', 'codex', '--channel', 'cli-receipt', '--wait-summary', 'quick-receipt');
+  assert.equal(combined.status, 0, combined.stderr);
+  assert.match(combined.stdout, /已排队: (msg_\w+)[\s\S]*message_id=\1 state=done[\s\S]*已验证中文导出。/);
+  const failedReceipt = await tool('bus_send', { to: 'codex', channel: 'inline', text: 'fail', wait_for_receipt_sec: 5 });
+  assert.match(failedReceipt, /state=failed[\s\S]*fixture failure/);
+  pass('一次派发取回验收结果，MCP 和 CLI 均可直接取得短回执');
 
   const previousBin = process.env.CLAUDE_BIN;
   try {
@@ -114,6 +171,9 @@ export async function regressions(home, request, pass, caller) {
     else process.env.CLAUDE_BIN = previousBin;
   }
   await claudeTransportRegression(home);
+  for (const kind of ['claude', 'agy']) {
+    assert.doesNotMatch(buildPeerPrompt({ from: caller, to: 'codex', targetKind: kind, text: 'probe' }), /tools\.write_stdin/);
+  }
   pass('Claude Code 对端：stdin、会话恢复、工具进度、完整回复和错误事件');
 
   for (const name of ['bus_status', 'bus_wait', 'bus_cancel', 'bus_reply']) {
@@ -136,7 +196,7 @@ export async function regressions(home, request, pass, caller) {
   assert.equal(loadConfig(paths).agents.agy.skipPermissions, false);
   pass('布尔开关：旧配置、CLI 写入和无效值拒绝');
 
-  const a = await send('hold-first', 'ordered');
+  const a = await send('hold-first', 'ordered', 'codex', { wait_for_receipt_sec: 1, reply_format: 'full' });
   const second = cli('send', '--from', 'agy', '--to', 'codex', '--channel', 'ordered', 'second');
   assert.equal(second.status, 0, second.stderr);
   const b = second.stdout.match(/msg_\w+/)?.[0];
@@ -146,12 +206,14 @@ export async function regressions(home, request, pass, caller) {
   const alternate = await send('different-peer', 'ordered', 'alternate');
   assert.match(await wait(other), /state\s+: done/);
   assert.match(await wait(alternate), /state\s+: done/);
+  assert.match(starts().find(s => s.label === 'different-peer').prompt, /tools\.write_stdin/);
   await until(() => readMessage(a, paths).session, '首轮会话就绪');
   assert.equal(readMessage(b, paths).state, 'queued');
   assert.equal(readMessage(c, paths).state, 'queued');
   assert.equal(starts().some(s => ['second', 'third'].includes(s.label)), false);
   fs.writeFileSync(path.join(home, 'release-hold-first'), '');
   assert.match(await wait(c), /state\s+: done/);
+  assert.equal(readMessage(a, paths).replyFormat, 'full');
   assert.deepEqual(starts().filter(s => ['hold-first', 'second', 'third'].includes(s.label)).map(({ label, session, resume }) => [label, session, resume]), [
     ['hold-first', 'session-hold-first', false], ['second', 'session-hold-first', true], ['third', 'session-hold-first', true]
   ]);
@@ -193,11 +255,14 @@ export async function regressions(home, request, pass, caller) {
   const running = active.id;
   const skipped = await send('never-start', 'cancel');
   const next = await send('after-cancel', 'cancel');
+  assert.match(await waitSummary(running, 0), /state=running/);
+  assert.match(await waitSummary(skipped, 0), /state=queued/);
   const waiting = wait(running);
   assert.match(await tool('bus_status', { message_id: running }), /state\s+: running/);
   assert.equal((await cancel(skipped)).ok, true);
   assert.equal((await cancel(running)).ok, true);
   assert.match(await waiting, /state\s+: cancelled/);
+  assert.match(await waitSummary(skipped), /state=cancelled[\s\S]*error \(cancelled\)/);
   assert.match((await asking).content[0].text, /bus_ask cancelled/);
   assert.match(await wait(next), /state\s+: done/);
   assert.equal(starts().some(s => s.label === 'never-start'), false);
@@ -223,6 +288,9 @@ export async function regressions(home, request, pass, caller) {
   assert.equal(listMessages({ to: caller }, paths).find(m => m.replyTo === a).readAt, null);
   assert.ok((await wait(a)).includes('reply:\n' + expected));
   assert.equal(jsonCli('wait', '--id', a).reply, expected);
+  const plainSummary = await waitSummary(a);
+  assert.match(plainSummary, /交付结论: unknown/);
+  assert.doesNotMatch(plainSummary, /END|progress:/);
   assert.equal(jsonCli('watch', '--id', a, '--json', '--keep-unread').reply, expected);
   const preview = jsonCli('status', a).reply;
   assert.ok(preview.endsWith('…') && !preview.includes('\n') && !preview.includes('END'));
@@ -240,7 +308,11 @@ export async function regressions(home, request, pass, caller) {
   assert.equal(shortWatch.status, 0, shortWatch.stderr);
   assert.match(shortWatch.stdout, /state=done[\s\S]*交付结论: partial[\s\S]*未验证或阻塞：真实桌面截图未验证[\s\S]*验证：单测通过[\s\S]*改动：src\/demo\.mjs/);
   assert.doesNotMatch(shortWatch.stdout, /progress|本轮用量/);
-  assert.match(starts().find(s => s.label === 'usage-resume').prompt, /"outcome":"completed \| partial \| needs_input \| unknown"/);
+  assert.match(starts().find(s => s.label === 'usage-resume').prompt, /"user_summary":""/);
+  const shortWait = await waitSummary(resumed);
+  assert.equal(shortWait, shortWatch.stdout.trimEnd());
+  assert.match(shortWait, /给用户的答复：已修复显示问题，桌面效果待确认。/);
+  assert.equal(jsonCli('wait', '--id', resumed, '--summary').acceptance.user_summary, '已修复显示问题，桌面效果待确认。');
   const resumedView = jsonCli('status', resumed);
   assert.equal(resumedView.session, fresh.session);
   assert.deepEqual(resumedView.usage, { input_tokens: 250, cached_input_tokens: 200, output_tokens: 21 });
@@ -253,8 +325,17 @@ export async function regressions(home, request, pass, caller) {
   const resumedCopy = listMessages({ to: caller, filter: entry => entry.replyTo === resumed }, paths)[0];
   const resumedInbox = await tool('bus_inbox', { channel: 'token-usage', summary: true });
   assert.match(resumedInbox, /交付结论: partial[\s\S]*真实桌面截图未验证/);
+  assert.match(resumedInbox, /给用户的答复：已修复显示问题，桌面效果待确认。/);
   assert.equal(readMessage(resumedCopy.id, paths).readAt, null);
   const contradictory = { ...JSON.parse(rawReply), outcome: 'completed' };
+  const oldReceipt = { outcome: 'completed', blockers: '', verification: '单测通过', next_step: '', changes: '' };
+  assert.deepEqual(parseAcceptance(JSON.stringify(oldReceipt)), oldReceipt);
+  assert.equal(parseAcceptance(JSON.stringify({ ...oldReceipt, user_summary: 42 })), null);
+  const oldTask = writeMessage({ ...createMessage({ from: caller, to: 'codex', text: 'legacy-receipt' }),
+    state: 'done', reply: JSON.stringify(oldReceipt), acceptance: oldReceipt }, paths);
+  const oldSummary = await waitSummary(oldTask.id);
+  assert.match(oldSummary, /交付结论: completed[\s\S]*验证：单测通过/);
+  assert.doesNotMatch(oldSummary, /给用户的答复|截短/);
   assert.equal(parseAcceptance(JSON.stringify(contradictory)), null);
   assert.equal(parseAcceptance(JSON.stringify({ ...contradictory, outcome: 'needs_input' })).outcome, 'needs_input');
   assert.match(await tool('bus_status', { message_id: resumed }), /本轮用量: 输入 250.*\n会话累计: 输入 1250/);
@@ -291,6 +372,7 @@ export async function regressions(home, request, pass, caller) {
   const failed = await send('fail', 'ordered');
   const retry = await send('after-failure', 'ordered');
   assert.match(await wait(failed), /state\s+: failed/);
+  assert.match(await waitSummary(failed), /state=failed[\s\S]*fixture failure/);
   assert.match(await wait(retry), /state\s+: done/);
   pass('对端失败后频道继续投递');
 
@@ -532,4 +614,10 @@ export async function regressions(home, request, pass, caller) {
   assert.match(await wait(lone), /state\s+: failed/);
   assert.equal(JSON.parse(fs.readFileSync(path.join(home, 'events', lone + '.json'))).code, 'worker_exited');
   pass('无后续任务时，watch 也能在失联对端退出后结算失败');
+  const noticeTest = spawnSync(process.execPath, [fileURLToPath(new URL('./origin-notices.mjs', import.meta.url))], {
+    env: { ...process.env, AGENT_BUS_HOME: home, CODEX_HOME: path.join(home, 'codex'), AGENT_BUS_DEPTH: '0' },
+    encoding: 'utf8', windowsHide: true, timeout: 30000
+  });
+  assert.equal(noticeTest.status, 0, noticeTest.stderr);
+  pass('原对话通知覆盖同频道双对话、断线后回传、短回执去重、失败和取消');
 }

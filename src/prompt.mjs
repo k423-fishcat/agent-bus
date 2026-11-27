@@ -2,7 +2,21 @@
 // prompt as an argv value, so bound what we hand to it.
 export const MAX_ARGV_PROMPT = 24000;
 
-export function buildPeerPrompt({ from, to, text, threadId, messageId, background = [], contextThread = null, replyFormat = 'full', maxChars = Infinity }) {
+const codexCommandWait = [
+  'For a long, finite, non-interactive command, use one functions.exec cell. Substitute your normal command arguments for ARGS.',
+  '```js',
+  '// @exec: {"yield_time_ms":300000}',
+  'let r = await tools.exec_command(ARGS);',
+  'while (r.session_id != null && r.exit_code == null) {',
+  '  if (r.output) text(r.output);',
+  '  r = await tools.write_stdin({session_id: r.session_id, chars: "", yield_time_ms: 60000});',
+  '}',
+  'text(r);',
+  '```',
+  'If the cell yields, resume its cell_id with functions.wait and a long yield. If a terminal session already exists, start with write_stdin on that session. With direct tools only, use long empty-stdin waits. Keep interactive commands and persistent services under stepwise control.'
+].join('\n');
+
+export function buildPeerPrompt({ from, to, targetKind = to, text, threadId, messageId, background = [], contextThread = null, replyFormat = 'full', maxChars = Infinity }) {
   const header = [
     `[agent-bus] Incoming message from peer agent "${from}".`,
     'This comes from another AI agent over a local bus, not from the human user.',
@@ -13,13 +27,15 @@ export function buildPeerPrompt({ from, to, text, threadId, messageId, backgroun
     text,
     'MESSAGE>>>',
     '',
+    ...(targetKind === 'codex' ? [codexCommandWait, ''] : []),
     `Write your reply for "${from}" now. Your final message is delivered verbatim,`,
     ...(replyFormat === 'summary' ? [
       'so return only a JSON object as a concise acceptance receipt, with string fields:',
-      '{"outcome":"completed | partial | needs_input | unknown","blockers":"","verification":"","next_step":"","changes":""}',
+      '{"outcome":"completed | partial | needs_input | unknown","user_summary":"","blockers":"","verification":"","next_step":"","changes":""}',
       'Choose one outcome. Use completed only when the requested work and its acceptance checks are complete.',
       'Use partial for incomplete work or unverified acceptance, needs_input if a decision or input is needed, and unknown if you cannot establish the outcome.',
-      'Write blockers (including unverified acceptance), checks actually run and their results, next step, and key changed paths in the language of the task. Use an empty string if a field does not apply. Omit logs and diffs.'
+      'In the language of the task, write user_summary as one or two sentences answering the user directly. State any limitation that affects the answer.',
+      'In verification, tie actual checks and results to the requested acceptance criteria. Put gaps in blockers. Include the next step and key changed paths where relevant. Leave inapplicable fields empty. Omit logs and diffs.'
     ] : ['so put the complete answer there.']),
     'Do not call agent-bus tools in this turn.'
   ].filter((line) => line !== null);

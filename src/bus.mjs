@@ -389,6 +389,7 @@ function peerPrompt(message, target, background) {
   return buildPeerPrompt({
     from: message.from,
     to: message.to,
+    targetKind: target.kind,
     text: message.text,
     threadId: message.threadId,
     messageId: message.id,
@@ -399,8 +400,9 @@ function peerPrompt(message, target, background) {
   });
 }
 
-function enqueueTask(target, fields) {
+function enqueueTask(target, fields, reservedId) {
   const message = createMessage(fields);
+  if (reservedId) message.id = reservedId;
   if (target.kind === 'agy') peerPrompt(message, target);
   return enqueue(message);
 }
@@ -643,11 +645,11 @@ export async function ask({ from, to, text, softTimeoutSec, session, newSession,
   };
 }
 
-export function send({ from, to, text, session, newSession, channel, cwd, model, effort, serviceTier, contextFromThread, runTimeoutSec, replyFormat }) {
+export function send({ from, to, text, session, newSession, channel, cwd, model, effort, serviceTier, contextFromThread, runTimeoutSec, replyFormat }, reservedId) {
   const cfg = loadConfig();
   agentOf(cfg, from);
   const target = agentOf(cfg, to);
-  const message = enqueueTask(target, { from, to, text, channel, cwd, model, effort, serviceTier, sessionOverride: session, newSession, contextFromThread, runTimeoutSec, replyFormat });
+  const message = enqueueTask(target, { from, to, text, channel, cwd, model, effort, serviceTier, sessionOverride: session, newSession, contextFromThread, runTimeoutSec, replyFormat }, reservedId);
   return {
     ok: true,
     status: 'queued',
@@ -747,6 +749,7 @@ function messageView(message, fullReply = false) {
     to: message.to,
     ...executionDetails(message),
     remainingMs,
+    ...(message.originNotice && { originNotice: message.originNotice }),
     createdAt: message.createdAt,
     startedAt: message.startedAt,
     elapsedMs,

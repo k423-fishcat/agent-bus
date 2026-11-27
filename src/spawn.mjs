@@ -2,9 +2,23 @@ import { spawn } from 'node:child_process';
 import readline from 'node:readline';
 
 export function killTree(pid) {
-  if (!pid) return;
+  if (!Number.isSafeInteger(pid) || pid <= 0) return;
   if (process.platform === 'win32') {
-    spawn('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+    const requestedAt = Date.now();
+    const options = { windowsHide: true, stdio: 'ignore' };
+    const taskkill = spawn('taskkill.exe', ['/pid', String(pid), '/T', '/F'], options);
+    taskkill.on('error', () => {}); // close also fires after a spawn error
+    taskkill.once('close', code => {
+      if (code === 0) return;
+      // MXC can deny taskkill's process lookup. PowerShell 7 can terminate the
+      // same tree via the local .NET process API. Ignore an exited or reused PID.
+      const script = [
+        `try { $p = [Diagnostics.Process]::GetProcessById(${pid}); $null = $p.Handle } catch { exit }`,
+        `if (([DateTimeOffset]$p.StartTime).ToUnixTimeMilliseconds() -le ${requestedAt}) { $p.Kill($true) }`
+      ].join('\n');
+      const fallback = spawn('pwsh.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], options);
+      fallback.on('error', () => {}); // PowerShell 7 is optional on older hosts.
+    });
     return;
   }
   try {

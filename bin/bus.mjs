@@ -30,6 +30,7 @@ import {
   resetPeerSession
 } from '../src/bus.mjs';
 import { printCodexTranscript } from '../src/transcript.mjs';
+import { installAgyNotices, registeredNoticeHome } from '../src/install-notices.mjs';
 import { formatInboxMessage, formatReceipt, formatStatus, receiptView } from '../src/status-format.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -182,9 +183,14 @@ async function cmdInstall(flags) {
   if (wants('agy') && cfg.agents.agy) {
     const bin = cfg.agents.agy.bin;
     out(`[agy] 注册 MCP server: ${bin}`);
+    const noticeHome = registeredNoticeHome();
+    const envArgs = ['-e', 'AGENT_BUS_AGENT=agy'];
+    if (noticeHome) envArgs.push('-e', 'AGENT_BUS_ORIGIN_NOTICES=1');
+    const home = noticeHome || process.env.AGENT_BUS_HOME;
+    if (home) envArgs.push('-e', `AGENT_BUS_HOME=${path.resolve(home)}`);
     const res = spawnSync(
       bin,
-      ['mcp', 'add', '-e', 'AGENT_BUS_AGENT=agy', 'agent-bus', process.execPath, MCP_ENTRY],
+      ['mcp', 'add', ...envArgs, 'agent-bus', process.execPath, MCP_ENTRY],
       { encoding: 'utf8', windowsHide: true }
     );
     registrationResult(res);
@@ -309,6 +315,11 @@ async function main() {
     case 'install':
       return cmdInstall(flags);
 
+    case 'install-agy-notices':
+      installAgyNotices();
+      out('已配置 Antigravity App 原对话回执。');
+      return;
+
     case 'doctor':
       return cmdDoctor();
 
@@ -347,7 +358,7 @@ async function main() {
         to,
         text,
         runTimeoutSec: typeof limit === 'string' && /^\d+$/.test(limit) ? Number(limit) : limit,
-        replyFormat: flags['reply-format'],
+        replyFormat: flags['reply-format'] ?? (flags['wait-summary'] ? 'summary' : undefined),
         channel: channelFlag(flags),
         cwd: flags.cwd ? path.resolve(flags.cwd) : undefined,
         model: flags.model,
@@ -358,6 +369,11 @@ async function main() {
         contextFromThread: flags['context-from']
       });
       out(`已排队: ${result.messageId}  channel=${result.channel}`);
+      if (flags['wait-summary']) {
+        const view = await watch({ messageId: result.messageId, consume: false });
+        out(formatReceipt(receiptView(view)));
+        return;
+      }
       if (result.runTimeoutSec != null) out(`本次执行上限 ${result.runTimeoutSec}s，从对端启动时计时。`);
       out('回复会进入发件人收件箱；用 `bus.mjs inbox --agent <名字>` 或 `bus.mjs wait --id ...` 获取。');
       return undefined;
@@ -366,7 +382,7 @@ async function main() {
     case 'wait': {
       const id = requireFlag(flags, 'id');
       const view = await wait({ messageId: id, timeoutSec: flags.timeout ? Number(flags.timeout) : 60 });
-      out(JSON.stringify(view, null, 2));
+      out(JSON.stringify(flags.summary ? receiptView(view) : view, null, 2));
       return undefined;
     }
 
@@ -510,16 +526,18 @@ async function main() {
 
 在 Claude Code 中调用 Codex:
   node bin/bus.mjs install --claude-only
+  node bin/bus.mjs install-agy-notices  # 启用 Antigravity App 原对话回执
   node bin/bus.mjs ask --from claude --to codex --cwd <目录> "问题"
 
 同步问答（默认 90s 软超时，超时返回 running 但不中断后台）:
   node bin/bus.mjs ask --from codex --to agy "问题" [--soft-timeout 90] [--block]
 异步派发:
   node bin/bus.mjs send --from claude --to codex "消息" [--run-timeout 900] [--reply-format summary]
+  --wait-summary  同一条命令等待并输出终态短回执，适合由客户端作为后台任务运行
   --run-timeout <秒>  仅覆盖本次后台执行上限，不含排队时间
 观测与回收:
   node bin/bus.mjs watch  --id msg_xxx [--summary] [--timeout 0] [--json] [--keep-unread] [--allow-failure]
-  node bin/bus.mjs wait   --id msg_xxx [--timeout 120]
+  node bin/bus.mjs wait   --id msg_xxx [--timeout 120] [--summary]
   node bin/bus.mjs status <msg_xxx>
   node bin/bus.mjs cancel --id msg_xxx
   node bin/bus.mjs inbox  --agent claude [--channel <频道>] [--cwd <目录>] [--summary]

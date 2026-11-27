@@ -73,8 +73,11 @@ if (label === 'fail') {
   emit({ type: 'turn.failed', error: { message: 'fixture failure' } });
 } else {
   const text = label === 'hold-first' ? '代码：\n' + '    answer();\n'.repeat(100) + 'END'
+    : label === 'quick-receipt' ? JSON.stringify({
+      outcome: 'completed', user_summary: '已验证中文导出。', verification: '中文回归用例通过', blockers: '', next_step: '', changes: ''
+    })
     : label === 'usage-resume' ? JSON.stringify({
-      outcome: 'partial', changes: 'src/demo.mjs ' + 'x'.repeat(750),
+      outcome: 'partial', user_summary: '已修复显示问题，桌面效果待确认。', changes: 'src/demo.mjs ' + 'x'.repeat(750),
       verification: '单测通过', blockers: '真实桌面截图未验证', next_step: '请在桌面会话验收'
     })
     : label;

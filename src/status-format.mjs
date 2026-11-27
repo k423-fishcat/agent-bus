@@ -17,6 +17,7 @@ export function formatStatus(view) {
     `elapsed    : ${view.elapsedMs != null ? `${Math.round(view.elapsedMs / 1000)}s` : '-'}`
   ];
   if (view.cwd) lines.push(`cwd        : ${view.cwd}`);
+  if (view.originNotice) lines.push(`原对话通知 : ${view.originNotice}`);
   if (view.runTimeoutSec != null) lines.push(`run_timeout: ${view.runTimeoutSec}s`);
   if (view.deadlineAt) lines.push(`deadline   : ${view.deadlineAt}`);
   if (view.remainingMs != null) lines.push(`remaining  : ${Math.ceil(view.remainingMs / 1000)}s`);
@@ -60,7 +61,8 @@ function clip(value, limit) {
 export function receiptView(view) {
   const acceptance = view.acceptance;
   const fields = acceptance && Object.fromEntries(
-    Object.entries({ blockers: 220, verification: 160, next_step: 100, changes: 120 })
+    Object.entries({ user_summary: 240, blockers: 220, verification: 160, next_step: 100, changes: 120 })
+      .filter(([field]) => Object.hasOwn(acceptance, field))
       .map(([field, limit]) => [field, clip(acceptance[field], limit)])
   );
   return {
@@ -93,7 +95,7 @@ export function formatReceipt(receipt) {
   if (receipt.outcome) lines.push(`交付结论: ${receipt.outcome}`);
   if (receipt.acceptance) {
     for (const [field, label] of [
-      ['blockers', '未验证或阻塞'], ['verification', '验证'],
+      ['user_summary', '给用户的答复'], ['blockers', '未验证或阻塞'], ['verification', '验证'],
       ['next_step', '下一步'], ['changes', '改动']
     ]) {
       const value = receipt.acceptance[field];

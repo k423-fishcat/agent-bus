@@ -4,9 +4,10 @@ import path from 'node:path';
 import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { VERSION, busPaths } from '../src/config.mjs';
-import { ask, send, inbox, reply, peers, statusView, wait, cancel, MAX_RUN_TIMEOUT_SEC } from '../src/bus.mjs';
-import { formatInboxMessage, formatStatus } from '../src/status-format.mjs';
+import { ask, send, inbox, reply, peers, statusView, wait, watch, cancel, MAX_RUN_TIMEOUT_SEC } from '../src/bus.mjs';
+import { formatInboxMessage, formatReceipt, formatStatus, receiptView } from '../src/status-format.mjs';
 import { printCodexTranscript } from '../src/transcript.mjs';
+import { dispatchToOrigin, finishInlineNotice } from '../src/origin-notices.mjs';
 
 const BUS_CLI = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 'bus.mjs');
 const backgroundWatch = id => `node "${BUS_CLI}" watch --id ${id} --allow-failure --summary`;
@@ -19,6 +20,7 @@ const AGENT = (() => {
 
 const DEPTH = Number(process.env.AGENT_BUS_DEPTH || 0);
 const MAX_DEPTH = 2;
+const ORIGIN_NOTICES = AGENT === 'agy' && DEPTH === 0 && process.env.AGENT_BUS_ORIGIN_NOTICES === '1';
 
 function audit(entry) {
   try {
@@ -85,18 +87,24 @@ const TOOLS = [
   {
     name: 'bus_send',
     description:
-      'Queue work for the peer and return immediately. Use this for development tasks, file edits, test runs, or anything that ' +
-      'may take more than a minute. For multi-step work and test suites, pass run_timeout_sec (e.g. 900). The detached worker ' +
-      'survives this request ending. Run the returned watch command as a background shell task for a short completion receipt, ' +
-      'then end your turn. Do not poll while work is running. Use bus_wait with the message ID for the original reply when needed.',
+      'Delegate the goal and acceptance criteria. Set wait_for_receipt_sec to collect a short receipt in the same call. ' +
+      'For long work, queue with reply_format=summary. End the turn if the result confirms delivery to this chat. ' +
+      'Otherwise use the returned watch command in the background for a notification. ' +
+      'Match receipt evidence to the criteria. Deliver user_summary when covered. Send only missing work or checks ' +
+      'back on the same channel. Use full when the user needs the original deliverable.',
     inputSchema: {
       type: 'object',
       properties: {
         to: { type: 'string', description: 'Target peer: "codex", "claude" (Claude Code), or "agy", if configured.' },
         text: { type: 'string', description: 'The task or message to queue.' },
+        ...(ORIGIN_NOTICES && { origin_ticket: { type: 'string', description: 'Set by the Antigravity App hook. Omit.' } }),
+        wait_for_receipt_sec: {
+          type: 'integer', minimum: 0, maximum: 90,
+          description: 'Wait up to this many seconds from dispatch for a short receipt (try 30). Default 0 returns immediately. On expiry, keep the task ID.'
+        },
         reply_format: {
           type: 'string', enum: ['full', 'summary'],
-          description: 'Use summary for a short structured acceptance result: outcome, blockers, verification, next step, and changed paths. Default: full.'
+          description: 'Use summary for a user-facing answer and acceptance evidence. Default: summary for inline or chat receipts, full otherwise.'
         },
         run_timeout_sec: {
           type: 'integer', minimum: 1, maximum: MAX_RUN_TIMEOUT_SEC,
@@ -132,12 +140,13 @@ const TOOLS = [
   {
     name: 'bus_wait',
     description:
-      'Wait for an existing task to settle, in bounded slices. Returns the full status (state, elapsed, session, recent progress, ' +
-      'and the complete multiline reply when done). A timeout returns the current queued/running state; you can wait again.',
+      'Wait by task ID. Use summary for a short acceptance receipt. Defaults to full status and reply. ' +
+      'On timeout returns the current queued/running state.',
     inputSchema: {
       type: 'object',
       properties: {
         message_id: { type: 'string', description: 'Task/message id.' },
+        summary: { type: 'boolean', description: 'Return the compact receipt used by watch and inbox.' },
         timeout_sec: { type: 'number', description: 'Max seconds to block (default 60, keep it under ~110).' }
       },
       required: ['message_id']
@@ -257,12 +266,17 @@ async function callTool(name, args) {
     }
 
     case 'bus_send': {
-      const result = send({
+      const receiptSec = args.wait_for_receipt_sec === undefined ? 0 : args.wait_for_receipt_sec;
+      if (!Number.isInteger(receiptSec) || receiptSec < 0 || receiptSec > 90) {
+        throw new Error('wait_for_receipt_sec 必须是 0～90 的整数秒');
+      }
+      const routed = ORIGIN_NOTICES && Boolean(args.origin_ticket);
+      const dispatch = reservedId => send({
         from: AGENT,
         to: args.to,
         text: args.text,
         runTimeoutSec: args.run_timeout_sec,
-        replyFormat: args.reply_format,
+        replyFormat: args.reply_format === undefined && (receiptSec > 0 || routed) ? 'summary' : args.reply_format,
         session: args.session,
         newSession: Boolean(args.new_session),
         channel: args.channel,
@@ -271,16 +285,22 @@ async function callTool(name, args) {
         effort: args.effort,
         serviceTier: args.service_tier,
         contextFromThread: args.context_from_thread
-      });
-      return textResult(
-        [
-          `已排队给 ${args.to}（channel=${result.channel}）: message_id=${result.messageId}。`,
-          ...(result.runTimeoutSec == null ? [] : [`本次执行上限 ${result.runTimeoutSec}s，从对端启动时计时。`]),
-          'Codex 等对端在后台执行。需要完成通知时，把下面的命令作为后台 shell 任务运行，然后结束本轮：',
-          `  ${backgroundWatch(result.messageId)}`,
-          '错过通知可按 channel 用 bus_inbox（summary: true）；详情按 ID 调用 bus_wait。'
-        ].join('\n')
-      );
+      }, reservedId);
+      const result = routed ? dispatchToOrigin(args.origin_ticket, dispatch, receiptSec) : dispatch();
+      let state = result.status;
+      if (receiptSec > 0) {
+        const view = await watch({ messageId: result.messageId, timeoutSec: receiptSec, consume: false });
+        if (!view.timedOut) {
+          const receipt = textResult(formatReceipt(receiptView(view)));
+          if (routed) receipt.onWritten = () => finishInlineNotice(args.origin_ticket, true);
+          return receipt;
+        }
+        if (routed) finishInlineNotice(args.origin_ticket, false);
+        state = view.state;
+      }
+      const limit = result.runTimeoutSec == null ? '' : ` run_timeout=${result.runTimeoutSec}s`;
+      if (routed) return textResult(`message_id=${result.messageId} state=${state} channel=${result.channel}${limit}\n终态将送回本对话，可以结束本轮。`);
+      return textResult(`message_id=${result.messageId} state=${state} channel=${result.channel}${limit}\n后台通知：${backgroundWatch(result.messageId)}`);
     }
 
     case 'bus_wait': {
@@ -288,7 +308,7 @@ async function callTool(name, args) {
         messageId: args.message_id,
         timeoutSec: args.timeout_sec !== undefined ? Number(args.timeout_sec) : 60
       });
-      return textResult(formatStatus(view));
+      return textResult(args.summary === true ? formatReceipt(receiptView(view)) : formatStatus(view));
     }
 
     case 'bus_cancel': {
@@ -334,7 +354,11 @@ async function callTool(name, args) {
 }
 
 function respond(id, result) {
-  process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id, result })}\n`);
+  const { onWritten, ...payload } = result;
+  process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id, result: payload })}\n`, error => {
+    if (error || !onWritten) return;
+    try { onWritten(); } catch (error) { audit({ event: 'receipt_write_error', error: error.message }); }
+  });
 }
 
 function respondError(id, code, message) {
@@ -350,7 +374,7 @@ function notify(method, params) {
  * for them. This keeps clients that treat silence as a stall from giving up.
  */
 function startHeartbeat(progressToken, totalSec) {
-  if (!progressToken) return () => {};
+  if (progressToken == null) return () => {};
   const startedAt = Date.now();
   const timer = setInterval(() => {
     const seconds = Math.round((Date.now() - startedAt) / 1000);
@@ -390,13 +414,15 @@ async function handle(message) {
     const name = params?.name;
     const args = params?.arguments || {};
     const progressToken = params?._meta?.progressToken;
-    const totalSec = Number(args.timeout_sec || args.soft_timeout_sec || 90);
+    const totalSec = Number(args.wait_for_receipt_sec || args.timeout_sec || args.soft_timeout_sec || 90);
     const started = Date.now();
 
-    const stopHeartbeat = name === 'bus_ask' || name === 'bus_wait' ? startHeartbeat(progressToken, totalSec) : () => {};
+    const mayWait = name === 'bus_ask' || name === 'bus_wait' || (name === 'bus_send' && args.wait_for_receipt_sec > 0);
+    const stopHeartbeat = mayWait ? startHeartbeat(progressToken, totalSec) : () => {};
     try {
       const result = await callTool(name, args);
-      audit({ tool: name, ok: !result.isError, ms: Date.now() - started, to: args.to || null });
+      audit({ tool: name, ok: !result.isError, ms: Date.now() - started, to: args.to || null,
+        responseChars: result.content[0].text.length });
       respond(id, result);
     } catch (error) {
       audit({ tool: name, ok: false, ms: Date.now() - started, error: String(error?.message || error) });
